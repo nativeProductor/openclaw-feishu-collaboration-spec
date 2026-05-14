@@ -8,7 +8,8 @@
   "scripts": {
     "clean": "rm -rf dist",
     "build": "tsc -p tsconfig.json",
-    "prepublishOnly": "npm run build"
+    "secret-scan": "! grep -RE '(cli_[a-f0-9]{16}|sk-[A-Za-z0-9]{32,}|tp-[a-z0-9]{40,})' src dist 2>/dev/null || (echo 'secrets found, aborting' && exit 1)",
+    "prepublishOnly": "npm run secret-scan && npm run build"
   },
   "dependencies": {
     "typebox": "1.1.37"
