@@ -1,25 +1,43 @@
 # openclaw-feishu-collaboration-spec
 
-> 让你的 OpenClaw bot 在飞书群里像同事一样听、说、接力。
+> A group-chat context layer for OpenClaw + lark-cli — when your bot gets @-mentioned, it actually knows what the group was just discussing.
 
-A plugin (and a specification) for **OpenClaw** bots that share a Feishu/Lark group: they listen to the whole conversation, only speak when @-mentioned, and chain replies with each other when relevant — with a graduated brake that lets bot↔bot dialogue fade naturally instead of hard-stopping.
+A supplemental plugin (and a specification) on top of **OpenClaw** + **lark-cli**. Its primary job: give every `@bot` reply the full recent group conversation as context. Secondary: let bots collaborate naturally with each other when relevant, with a graduated brake that lets bot↔bot dialogue fade instead of hard-stopping.
 
 **Status**: v0.1 in active development. Skeleton + architecture + QA plan complete. Modules A/B/C/D implementation in progress.
 
 ## Why
 
-Out of the box, an OpenClaw Feishu bot in a group chat can only "see" messages it was @-mentioned in. So when someone @-mentions it with a follow-up question, the bot has no idea what the group was just talking about. And if two bots are in the same group, they can't carry on a thread together because the second bot doesn't @-mention the first one back.
+Out of the box, an OpenClaw bot in a Feishu group can only "see" the single message that @-mentioned it. Everything the group was discussing in the preceding minutes is invisible — OpenClaw's channel-layer mention gate drops unmentioned messages before they reach the agent.
 
-This plugin fixes both ends, plus a few related rough edges, with a **zero-config install** — drop it onto any OpenClaw bot and it works in every group that bot joins.
+So this happens, all the time:
+
+> Someone in the group spends 10 minutes discussing a project, then @-mentions the bot: "what do you think?"
+> Bot: "Sorry, what are you referring to?"
+
+**This is the problem regardless of who's @-mentioning** — a human, another bot, an alerting trigger, doesn't matter. Same root cause: the bot lacks group context at reply time. This plugin fixes that as the primary feature; the bot↔bot collaboration story is a derivative once context exists.
+
+It's a **zero-config install** — drop it onto any OpenClaw bot and it works in every group that bot joins, no per-chat or per-bot setup.
+
+## How it relates to lark-cli
+
+| | Responsibility |
+|---|---|
+| **lark-cli** | Bot **operates** Feishu — send/receive, calendar, base, docs, etc. The action surface. |
+| **this plugin** | Bot **understands** the Feishu group it's operating in — who said what when, recent decisions, ongoing threads. The context layer. |
+
+They are decoupled. Any OpenClaw + lark-cli deployment can install this plugin to add the context layer; no lark-cli changes are required.
 
 ## What it does
 
-| Module | Capability | Status |
-|---|---|---|
-| **A. Capture** | Hooks `inbound_claim` to passively record every group message (mentioned or not) into a local per-group SQLite store | scaffold |
-| **B. Reply Gate** | In groups, bot replies only when @-mentioned (`mention-only` default); autonomous classifier mode planned for Phase 2 | scaffold |
-| **C. Context Inject** | When the bot does reply, the recent group conversation is fed into its prompt; also exposed via `memory_search` corpus supplement | scaffold |
-| **D. Cross-Bot @-back** | If the inbound was from another bot, the outgoing reply auto-includes `<at>` so the other bot's mention gate triggers. Graduated brake at depth 3→5 makes the chain fade naturally | scaffold |
+| Module | Capability | Who triggers it | Status |
+|---|---|---|---|
+| **A. Capture** | Hooks `inbound_claim` to record **every** group message — even ones not @-mentioning the bot — into a local per-group SQLite store | every inbound msg | scaffold |
+| **B. Reply Gate** | In groups, bot replies only when @-mentioned (`mention-only` default). P2P unchanged. Autonomous classifier mode is Phase 2 | every group inbound | scaffold |
+| **C. Context Inject** | When the bot does reply (to a user OR a bot), the last ~20 group msgs are injected into the prompt; same store also exposed via `memory_search` corpus supplement | every reply turn | scaffold |
+| **D. Cross-Bot @-back** | When the inbound was from another bot, auto-include `<at>` in the reply so the chain continues. Graduated brake at depth 3→5 makes it fade naturally | bot-from-bot inbound | scaffold |
+
+**Module C is the headline.** A/B/D exist to make C feel right in practice.
 
 See [`docs/INTRO-zh.md`](docs/INTRO-zh.md) for the friendly Chinese introduction, [`docs/architecture.md`](docs/architecture.md) for the full design.
 
