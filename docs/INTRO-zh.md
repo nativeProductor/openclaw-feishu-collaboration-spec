@@ -175,6 +175,4 @@ v0.1 发布时,图片消息按 `[图片]` 标记入库;完整 vision 支持(走 
 ## 相关链接
 
 - GitHub: <https://github.com/nativeProductor/openclaw-feishu-collaboration-spec>
-- 架构深度: [`docs/architecture.md`](architecture.md)
-- 测试验收标准: [`plugin/TEST-PLAN.md`](../plugin/TEST-PLAN.md)
 - License: MIT

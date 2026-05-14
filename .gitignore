@@ -1,19 +1,17 @@
-# Secrets
+# Secrets — never commit
 .env
 **/.env
-!.env.example
-!**/.env.example
 
 # Node
 node_modules/
 **/node_modules/
 package-lock.json.bak
 
-# Build output
+# Build output (rebuilt from source)
 dist/
 **/dist/
 
-# Packed tarballs (rebuild from source)
+# Packed tarballs (rebuilt from source)
 *.tgz
 
 # Editor / OS
@@ -27,5 +25,31 @@ dist/
 tmp/
 .cache/
 
-# Symlinks created during dev for type resolution
+# Dev type-resolution symlinks
 plugin/node_modules
+
+# -----------------------------------------------------------------------------
+# Dev / process artifacts — kept local, never pushed to the public repo.
+# These are the byproducts of plugin development and verification, not part
+# of the plugin's runtime or installable surface.
+# -----------------------------------------------------------------------------
+
+# Internal design history & research
+docs/architecture.md
+docs/memory-core-audit.md
+docs/cross-bot-identity-research.md
+docs/inbound-claim-debug.md
+docs/PM-review-*.md
+
+# Internal QA acceptance plan
+plugin/TEST-PLAN.md
+
+# Local test harness (lark-cli wrappers for sending stimuli + log watching)
+harness/
+
+# Dev bootstrap scripts (spin up a local dev bot, sync local doc to Feishu)
+scripts/
+
+# Project root env scaffolding (only needed by the local dev scripts above)
+.env.example
+.feishu-doc-id

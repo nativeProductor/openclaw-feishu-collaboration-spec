@@ -39,7 +39,7 @@ They are decoupled. Any OpenClaw + lark-cli deployment can install this plugin t
 
 **Module C is the headline.** A/B/D exist to make C feel right in practice.
 
-See [`docs/INTRO-zh.md`](docs/INTRO-zh.md) for the friendly Chinese introduction, [`docs/architecture.md`](docs/architecture.md) for the full design.
+See [`docs/INTRO-zh.md`](docs/INTRO-zh.md) for the Chinese introduction.
 
 ## Design invariants (locked)
 
@@ -76,29 +76,24 @@ Required Feishu scopes (in feishu.cn console for each app using the plugin):
 ## Repo layout
 
 ```
-plugin/        npm package source (TypeScript), the installable artifact
-docs/          architecture, audit reports, intro
-harness/       dev test harness (lark-cli wrapper for sending stimuli)
-scripts/       bootstrap helpers for spinning up a local "bot2" dev instance
+plugin/         npm package source (TypeScript) — the installable artifact
+docs/INTRO-zh.md   Chinese-language introduction (mirrors a Feishu cloud doc)
+README.md       this file
+LICENSE         MIT
 ```
 
-## Development
+## Building from source
 
 ```bash
 git clone https://github.com/nativeProductor/openclaw-feishu-collaboration-spec
-cd openclaw-feishu-collaboration-spec
-cp .env.example .env  # fill in your Feishu + Xiaomi creds for the dev bot
-cp harness/.env.example harness/.env  # if you want to run the test harness
-
-# build the plugin
-cd plugin && npm install --registry=https://registry.npmjs.org && npm run build && npm pack
-
-# bring up a local dev bot
-bash scripts/bootstrap-bot2.sh
+cd openclaw-feishu-collaboration-spec/plugin
+npm install --registry=https://registry.npmjs.org
+npm run build
+npm pack
+# → openclaw-feishu-collaboration-spec-<version>.tgz
+# then: openclaw plugins install ./openclaw-feishu-collaboration-spec-<version>.tgz
 ```
-
-See [`plugin/TEST-PLAN.md`](plugin/TEST-PLAN.md) for the QA acceptance criteria (41 test cases across Modules A/B/C/D + universality + negative + perf).
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
