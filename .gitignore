@@ -1,0 +1,31 @@
+# Secrets
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Node
+node_modules/
+**/node_modules/
+package-lock.json.bak
+
+# Build output
+dist/
+**/dist/
+
+# Packed tarballs (rebuild from source)
+*.tgz
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Logs / scratch
+*.log
+tmp/
+.cache/
+
+# Symlinks created during dev for type resolution
+plugin/node_modules

@@ -1,0 +1,51 @@
+{
+  "name": "openclaw-feishu-collaboration-spec",
+  "version": "0.0.1",
+  "description": "OpenClaw plugin: passive group transcript capture, mention-based reply gate, cross-bot @-back, and graduated loop guard for Feishu/Lark.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "typebox": "1.1.37"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.6"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "npmSpec": "openclaw-feishu-collaboration-spec",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.5.6"
+    },
+    "compat": {
+      "pluginApi": ">=2026.5.6"
+    },
+    "build": {
+      "openclawVersion": "2026.5.6"
+    }
+  },
+  "files": [
+    "dist/**",
+    "openclaw.plugin.json"
+  ]
+}

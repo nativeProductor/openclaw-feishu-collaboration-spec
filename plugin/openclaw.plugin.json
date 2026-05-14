@@ -1,0 +1,68 @@
+{
+  "id": "feishu-collab",
+  "name": "OpenClaw Feishu Collaboration",
+  "description": "Passive group transcript capture, mention-based reply gate, cross-bot @-back, and graduated loop guard for Feishu/Lark.",
+  "version": "0.0.1",
+  "enabledByDefault": true,
+  "activation": {
+    "onStartup": true,
+    "onChannels": ["feishu"],
+    "onCapabilities": ["hook"]
+  },
+  "channels": [],
+  "contracts": {
+    "tools": []
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "description": "Zero-topology config: no chat_id / open_id / app_id allowlists. All routing is runtime-discovered.",
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Master switch."
+      },
+      "gate": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["mention-only", "autonomous"],
+            "default": "mention-only"
+          }
+        }
+      },
+      "context": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "lastN": { "type": "number", "default": 20, "minimum": 1, "maximum": 200 },
+          "ttlHours": { "type": "number", "default": 168, "minimum": 1 },
+          "maxRowsPerChat": { "type": "number", "default": 2000, "minimum": 100 }
+        }
+      },
+      "crossBot": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "atBack": { "type": "boolean", "default": true, "description": "Auto @-mention the originating bot in replies." },
+          "loopMaxDepth": {
+            "type": "number",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 20,
+            "description": "After this many consecutive bot-bot turns, drop the @-back so the conversation fades. Hard-skip past N+1 turns."
+          },
+          "softHintAtDepth": {
+            "type": "number",
+            "default": 3,
+            "description": "Inject 'consider wrapping up' system-prompt hint starting at this depth."
+          }
+        }
+      }
+    }
+  }
+}
