@@ -97,7 +97,7 @@ cd plugin && npm install --registry=https://registry.npmjs.org && npm run build 
 bash scripts/bootstrap-bot2.sh
 ```
 
-See [`plugin/TEST-PLAN.md`](plugin/TEST-PLAN.md) for the QA acceptance criteria (43 test cases across Modules A/B/C/D + universality + negative + perf).
+See [`plugin/TEST-PLAN.md`](plugin/TEST-PLAN.md) for the QA acceptance criteria (41 test cases across Modules A/B/C/D + universality + negative + perf).
 
 ## License
 

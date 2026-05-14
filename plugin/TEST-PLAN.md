@@ -212,38 +212,6 @@ expected:
   - '[feishu-collab] gate-decision: reply (reason=explicit-mention)'
 ```
 
-#### B-3 cooldown / anti-spam
-
-```yaml
-id: B-3.1
-module: B
-title: rapid duplicate @-mentions → bot replies only first within cooldown window
-preconditions:
-  - cooldown_ms=10000 (TBD with Dev)
-steps:
-  - send_as: bot1
-    text: '<at user_id="$OPEN_ID_BOT2"></at> q1'
-  - wait_for: 'bot2 DISP-E'
-  - send_as: bot1
-    text: '<at user_id="$OPEN_ID_BOT2"></at> q2'
-    delay_ms: 2000
-expected:
-  - first message: 'gate-decision: reply'
-  - second message: 'gate-decision: skip (reason=cooldown)'
-```
-
-```yaml
-id: B-3.2
-module: B
-title: cooldown expires → next mention replies
-steps:
-  - (B-3.1 setup) then wait > cooldown_ms
-  - send_as: bot1
-    text: '<at user_id="$OPEN_ID_BOT2"></at> q3'
-expected:
-  - 'gate-decision: reply'
-```
-
 ### Module C — Context Inject
 
 Goal: when Module B decides to reply, the prompt to the LLM contains the last N group messages.
@@ -424,7 +392,7 @@ steps:
   - run `openclaw config validate`
 expected:
   - validation error: unknown property `knownBotOpenIds` / `perChat`
-  - schema export shows ONLY policy fields (mode, cooldown_ms, window, atBack, etc.) and ZERO id-list fields
+  - schema export shows ONLY policy fields (mode, window, atBack, etc.) and ZERO id-list fields
 ```
 
 ---
@@ -702,7 +670,6 @@ Blocking deliverables — please confirm before sprint exit:
 1. **Hook names / log strings.** Dev must emit at minimum the strings enumerated in §0.3. If names change, update this doc in the same PR.
 2. **Config schema.** YAML/JSON shape for:
    - `mode: mention-only | autonomous`
-   - `cooldown_ms: int`
    - `context.window: int`
    - `context.source: feishu-api | memory-core`
    - `cross_bot.enabled: bool`
@@ -718,15 +685,14 @@ Blocking deliverables — please confirm before sprint exit:
 ## 6. Open questions for the user / product owner
 
 1. **Mention-only scope**: does an `@bot2` *inside a reply-thread* (Feishu native reply, not free-text quote) count as a mention? Likely yes — please confirm so we can lock B-1.4.
-2. **Cooldown granularity**: per-user, per-group, or global? §B-3 currently assumes per-group.
-3. **Cross-bot reply-with-at**: when bot2's reply contains the @-back, should the visible text *prepend* the `<at>` or *embed* it mid-sentence? Affects user readability.
-4. **Loop guard**: depth=5 is a placeholder. What's the product intent — 3? 10? Should the bot also rate-limit (e.g. ≤ 1 cross-bot turn per 30s) as a second axis?
-5. **Context source default**: ship with `feishu-api` and let memory-core be opt-in, or auto-detect when memory-core is installed?
-6. **P2P bypass (B-1.5)**: should DMs bypass the gate entirely, or also honor mention-only? Current draft assumes bypass.
-7. **@all behavior (B-1.6)**: ignore is the safe default but product may want bot2 to acknowledge `@all` announcements.
-8. **Image/file messages (N-2)**: do we want a Phase-1 reply-with-OCR/vision-summary, or pure skip?
-9. **Restart durability (N-7)**: should loop-guard depth survive a bot2 restart? If yes, where do we persist it (`~/.openclaw-bot2/state/feishu-collab.json`)?
-10. **Phase-2 split**: should the autonomous-mode test suite move to a sibling file `TEST-PLAN-PHASE2.md` once B-2 lands, or stay merged? Current doc keeps B-2 inline as a placeholder.
+2. **Cross-bot reply-with-at**: when bot2's reply contains the @-back, should the visible text *prepend* the `<at>` or *embed* it mid-sentence? Affects user readability.
+3. **Loop guard**: depth=5 is a placeholder. What's the product intent — 3? 10? Should the bot also rate-limit (e.g. ≤ 1 cross-bot turn per 30s) as a second axis?
+4. **Context source default**: ship with `feishu-api` and let memory-core be opt-in, or auto-detect when memory-core is installed?
+5. **P2P bypass (B-1.5)**: should DMs bypass the gate entirely, or also honor mention-only? Current draft assumes bypass.
+6. **@all behavior (B-1.6)**: ignore is the safe default but product may want bot2 to acknowledge `@all` announcements.
+7. **Image/file messages (N-2)**: do we want a Phase-1 reply-with-OCR/vision-summary, or pure skip?
+8. **Restart durability (N-7)**: should loop-guard depth survive a bot2 restart? If yes, where do we persist it (`~/.openclaw-bot2/state/feishu-collab.json`)?
+9. **Phase-2 split**: should the autonomous-mode test suite move to a sibling file `TEST-PLAN-PHASE2.md` once B-2 lands, or stay merged? Current doc keeps B-2 inline as a placeholder.
 
 ---
 
@@ -743,8 +709,6 @@ Blocking deliverables — please confirm before sprint exit:
 | B-2.1 | B      | autonomous YES                                                   |
 | B-2.2 | B      | autonomous NO                                                    |
 | B-2.3 | B      | autonomous override on explicit mention                          |
-| B-3.1 | B      | cooldown blocks rapid dupes                                      |
-| B-3.2 | B      | cooldown expires → reply                                         |
 | C-1.1 | C      | last N messages injected                                         |
 | C-1.2 | C      | window cap honored                                               |
 | C-1.3 | C      | excludes system events                                           |
@@ -772,4 +736,4 @@ Blocking deliverables — please confirm before sprint exit:
 | P-4   | P      | no memory leak over 200 msgs                                     |
 | P-5   | P      | log volume sane                                                  |
 
-Total: 37 cases (11 B, 6 C, 6 D, 9 N, 5 P).
+Total: 41 cases (9 B, 6 C, 6 D, 6 U, 9 N, 5 P).

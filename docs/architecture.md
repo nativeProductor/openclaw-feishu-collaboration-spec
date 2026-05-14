@@ -149,10 +149,10 @@ Survives restart (per QA's N-7 concern). Pruned on inactivity > 1h.
 
 ## Open questions (still pending product decision)
 
-- **Cooldown** (Q4 from prior discussion): user said "didn't get the question". Re-explained as "rate limit replies when one human spams". My recommendation: **Phase 1 = no cooldown**; reasoning model latency (~10s/turn) is natural backpressure. Add per-`(chat,sender)` cooldown in Phase 2 alongside autonomous mode.
+_None blocking Phase 1. Cooldown / rate-limit behavior is deferred to Phase 2 alongside autonomous mode (natural backpressure from reasoning-model latency is acceptable for v0.1)._
 
 ## References
 
 - `docs/memory-core-audit.md` — full audit report (verdict: NEEDS-GLUE, plan B + corpus supplement)
 - `docs/cross-bot-identity-research.md` — open_id resolution recipe (Feishu renderer is server-normalized — huge simplification)
-- `plugin/TEST-PLAN.md` — 43-case QA plan (Module B/C/D/U + negative + perf)
+- `plugin/TEST-PLAN.md` — 41-case QA plan (Module B/C/D/U + negative + perf)
