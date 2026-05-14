@@ -48,6 +48,16 @@ See [`docs/INTRO-zh.md`](docs/INTRO-zh.md) for the Chinese introduction.
 3. **Sane defaults**. `gate.mode=mention-only`, `crossBot.atBack=true`, `context.enabled=true`, `loop.maxDepth=5`. Touch nothing and you get the intended behavior.
 4. **Reuse the model's existing tool surface**. The agent sees one `memory_search` tool, not two — our store is a corpus supplement, not a parallel API.
 
+## Related X/Twitter workflows
+
+Keep this plugin focused on Feishu/Lark group context: passive transcript capture, mention-gated replies, prompt context injection, and cross-bot @-back. If the same OpenClaw group needs public X/Twitter context, install TweetClaw as a separate plugin:
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+```
+
+[TweetClaw](https://github.com/Xquik-dev/tweetclaw) covers scrape tweets, tweet scraper workflows, search tweets, search tweet replies, follower export, user lookup, media upload, media download, direct messages, monitor tweets, webhooks, giveaway draws, and approval-gated post tweets or post tweet replies. This plugin can then keep the Feishu discussion and follow-up decisions in group context while TweetClaw handles X/Twitter data retrieval and visible X/Twitter actions. See the [ClawHub listing](https://clawhub.ai/plugins/@xquik/tweetclaw) or [npm package](https://www.npmjs.com/package/@xquik/tweetclaw). Keep Feishu/Lark and X/Twitter credentials separate, and review visible X/Twitter actions through OpenClaw approval flows.
+
 ## Install
 
 ```bash
