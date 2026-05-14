@@ -46,15 +46,40 @@
 //
 // To stay robust if registration order ever flips, Module C also re-checks
 // the run-context gate state and bails out if it sees `outcome: 'skip'`.
+//
+// Note (2026-05): Both modules switched from `inbound_claim` (which doesn't
+// fire for non-bundled plugins on our path) to `message_received` (which
+// unconditionally fires pre-mention-gate). The message_received event is
+// thinner; we recover chat_id from ctx.conversationId.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type {
-  PluginHookInboundClaimContext,
-  PluginHookInboundClaimEvent,
-  PluginHookInboundClaimResult,
-} from 'openclaw/plugin-sdk/plugin-entry';
 import { LarkShellError, runLarkCliJson } from '../lib/lark-shell.js';
 import { getBotOpenId } from './reply-gate.js';
+
+// `message_received` event/ctx types are declared in the SDK but NOT
+// re-exported from `openclaw/plugin-sdk/plugin-entry`. We declare just the
+// fields we touch so we don't depend on a private import path. Shape mirrors
+// hook-message.types.d.ts.
+type PluginHookMessageReceivedEvent = {
+  from: string;
+  content: string;
+  timestamp?: number;
+  threadId?: string | number;
+  messageId?: string;
+  senderId?: string;
+  sessionKey?: string;
+  runId?: string;
+  metadata?: Record<string, unknown>;
+};
+type PluginHookMessageContext = {
+  channelId: string;
+  accountId?: string;
+  conversationId?: string;
+  sessionKey?: string;
+  runId?: string;
+  messageId?: string;
+  senderId?: string;
+};
 
 // `before_prompt_build` event/result types live in the SDK but aren't
 // re-exported from `openclaw/plugin-sdk/plugin-entry`. We declare the fields
@@ -76,6 +101,36 @@ const CONTEXT_NAMESPACE = 'context-inject';
 const GATE_NAMESPACE = 'reply-gate';
 const DEFAULT_LAST_N = 20;
 const OVERFETCH_PAD = 5;
+
+/**
+ * In-memory bridge from `message_received` → `before_prompt_build`,
+ * keyed by sessionKey. See reply-gate.ts for the rationale (runId is not
+ * assigned at message_received time).
+ */
+type PendingContext = {
+  chatId?: string;
+  triggerMessageId?: string;
+  channel?: string;
+  ts: number;
+};
+const pendingContextBySession = new Map<string, PendingContext>();
+const CONTEXT_PENDING_TTL_MS = 5 * 60_000;
+
+function setPendingContext(sessionKey: string, state: Omit<PendingContext, 'ts'>): void {
+  if (!sessionKey) return;
+  pendingContextBySession.set(sessionKey, { ...state, ts: Date.now() });
+}
+function consumePendingContext(sessionKey: string | undefined): PendingContext | undefined {
+  if (!sessionKey) return undefined;
+  const now = Date.now();
+  for (const [k, v] of pendingContextBySession) {
+    if (now - v.ts > CONTEXT_PENDING_TTL_MS) pendingContextBySession.delete(k);
+  }
+  const entry = pendingContextBySession.get(sessionKey);
+  if (!entry) return undefined;
+  pendingContextBySession.delete(sessionKey);
+  return entry;
+}
 
 type CtxApi = {
   pluginConfig?: Record<string, unknown> | undefined;
@@ -159,18 +214,30 @@ function readContextConfig(api: CtxApi): { enabled: boolean; lastN: number } {
   };
 }
 
-function extractChatId(event: PluginHookInboundClaimEvent): string | undefined {
-  if (typeof event.conversationId === 'string' && event.conversationId.length > 0) {
-    return event.conversationId;
+function stripChannelPrefix(value: string): string {
+  for (const prefix of ['channel:', 'chat:', 'user:', 'feishu:']) {
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
   }
-  const meta = event.metadata ?? {};
-  const direct = (meta as { chat_id?: unknown; chatId?: unknown });
-  if (typeof direct.chat_id === 'string') return direct.chat_id;
-  if (typeof direct.chatId === 'string') return direct.chatId;
-  const raw = (meta as { raw?: unknown }).raw;
-  if (raw && typeof raw === 'object') {
-    const message = (raw as { message?: { chat_id?: unknown } }).message;
-    if (message && typeof message.chat_id === 'string') return message.chat_id;
+  return value;
+}
+
+function extractChatId(
+  event: PluginHookMessageReceivedEvent,
+  ctx: PluginHookMessageContext,
+): string | undefined {
+  // ctx.conversationId is the canonical source under message_received; for
+  // Feishu groups this is the `oc_…` chat_id (possibly with a `chat:` host
+  // prefix). We strip the prefix so lark-cli calls receive a clean id.
+  if (typeof ctx?.conversationId === 'string' && ctx.conversationId.length > 0) {
+    return stripChannelPrefix(ctx.conversationId);
+  }
+  const meta = event?.metadata ?? {};
+  const direct = (meta as { chat_id?: unknown; chatId?: unknown; to?: unknown });
+  if (typeof direct.chat_id === 'string') return stripChannelPrefix(direct.chat_id);
+  if (typeof direct.chatId === 'string') return stripChannelPrefix(direct.chatId);
+  if (typeof direct.to === 'string') {
+    const stripped = stripChannelPrefix(direct.to);
+    if (stripped.startsWith('oc_')) return stripped;
   }
   return undefined;
 }
@@ -353,54 +420,62 @@ export function register(api: CtxApi): void {
   // Phase 1.5 stub — register once on plugin load.
   registerCorpusSupplementStub(api);
 
-  const inboundClaimHandler = async (
-    event: PluginHookInboundClaimEvent,
-    ctx: PluginHookInboundClaimContext,
-  ): Promise<PluginHookInboundClaimResult | void> => {
-    const runId = ctx.runId ?? event.runId;
-    if (!runId) return undefined;
-    const chatId = extractChatId(event);
-    const state: ContextRunState = {
+  const messageReceivedHandler = async (
+    event: PluginHookMessageReceivedEvent,
+    ctx: PluginHookMessageContext,
+  ): Promise<void> => {
+    const sessionKey = ctx?.sessionKey ?? event?.sessionKey;
+    const chatId = extractChatId(event, ctx);
+    const state = {
       chatId,
-      triggerMessageId: event.messageId ?? ctx.messageId,
-      channel: event.channel,
+      triggerMessageId: event?.messageId ?? ctx?.messageId,
+      channel: ctx?.channelId,
     };
-    try {
-      api.setRunContext({
-        runId,
-        namespace: CONTEXT_NAMESPACE,
-        value: state,
-        mergeStrategy: 'replace',
-      });
-    } catch (err) {
-      log(api, 'warn', `context-inject setRunContext failed: ${(err as Error).message}`);
+    if (sessionKey) {
+      setPendingContext(sessionKey, state);
     }
-    return undefined;
+    // Best-effort: also setRunContext if a runId IS present (it usually isn't
+    // at message_received time, but no harm if it does).
+    const runId = ctx?.runId ?? event?.runId;
+    if (runId) {
+      try {
+        api.setRunContext({
+          runId,
+          namespace: CONTEXT_NAMESPACE,
+          value: state,
+          mergeStrategy: 'replace',
+        });
+      } catch (err) {
+        log(api, 'warn', `context-inject setRunContext failed: ${(err as Error).message}`);
+      }
+    }
   };
 
   const beforePromptBuildHandler = async (
     _event: PluginHookBeforePromptBuildEvent,
-    ctx: { runId?: string },
+    ctx: { runId?: string; sessionKey?: string },
   ): Promise<PluginHookBeforePromptBuildResult | void> => {
     const cfg = readContextConfig(api);
     if (!cfg.enabled) {
       log(api, 'debug', 'context-disabled (config)');
       return undefined;
     }
-    const runId = ctx?.runId;
-    if (!runId) return undefined;
 
-    // Defensive cross-check against the gate decision. If Module B somehow
-    // ran AFTER us (registration order mishap), we'd otherwise pay for a
-    // doomed fetch.
-    const gateState = api.getRunContext<GateRunState>({ runId, namespace: GATE_NAMESPACE });
-    if (gateState?.decision?.outcome === 'skip') {
-      return undefined;
+    // Prefer the session-key bridge (set by our own message_received) over
+    // setRunContext, because runId isn't usually assigned at the time we
+    // capture the inbound. Fall back to runContext if present.
+    let state: { chatId?: string; triggerMessageId?: string } | undefined =
+      consumePendingContext(ctx?.sessionKey);
+    if ((!state || !state.chatId) && ctx?.runId) {
+      const stored = api.getRunContext<ContextRunState>({
+        runId: ctx.runId,
+        namespace: CONTEXT_NAMESPACE,
+      });
+      if (stored?.chatId) state = stored;
     }
-
-    const state = api.getRunContext<ContextRunState>({ runId, namespace: CONTEXT_NAMESPACE });
     if (!state?.chatId) {
-      // No inbound feishu context — either CLI-triggered or non-group.
+      // No captured feishu context — either CLI-triggered, non-group, or
+      // session-key mismatch. Bail silently.
       return undefined;
     }
 
@@ -430,6 +505,6 @@ export function register(api: CtxApi): void {
     };
   };
 
-  api.on('inbound_claim', inboundClaimHandler);
+  api.on('message_received', messageReceivedHandler);
   api.on('before_prompt_build', beforePromptBuildHandler);
 }

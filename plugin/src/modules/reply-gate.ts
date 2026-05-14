@@ -10,19 +10,25 @@
 //                              → real autonomous behaviour lands in Phase 2
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// Why two hooks (inbound_claim + before_prompt_build):
+// Why two hooks (message_received + before_prompt_build):
 //
-// The SDK's `PluginHookBeforePromptBuildEvent` only exposes { prompt, messages }
-// — no chat_type, no mentions list, no chat_id. That data IS on the
-// `inbound_claim` event (isGroup, wasMentioned, metadata, etc.). Per
-// docs/architecture.md, inbound_claim is also the only hook that sees ALL
-// inbound group messages (it runs before the host's own mention-gate strips
-// unmentioned messages).
+// `inbound_claim` does NOT fire for non-bundled plugins on our path — it's
+// gated by `pluginOwnedBinding` in dispatch-DHFZoYxZ.js:526 which requires
+// explicit user ceremony. The unconditional hook that fires pre-mention-gate
+// for every inbound is `message_received` (fireAndForgetHook at
+// dispatch-DHFZoYxZ.js:569). So we use that instead.
+//
+// The trade-off: PluginHookMessageReceivedEvent is THINNER than
+// PluginHookInboundClaimEvent. It has no `isGroup`, `wasMentioned`, or
+// structured `mentions[]` array. But the data we need is recoverable:
+//   - isGroup  → ctx.conversationId starts with 'oc_' (Feishu group chat IDs)
+//   - mentions → scan event.content for <at user_id="ou_..."> tags
+//   - wasMentioned → derive from mentions ∩ {botOpenId}
 //
 // So the wiring is:
-//   inbound_claim   → compute decision (skip|reply, with reason) using
-//                     event.isGroup + event.wasMentioned + config.gate.mode,
-//                     stash into setRunContext(namespace='gate', runId=...).
+//   message_received → compute decision (skip|reply, with reason) using
+//                     conversationId-shape + mention-tag scan + config.gate.mode,
+//                     stash into setRunContext(namespace='reply-gate', runId=...).
 //   before_prompt_build → read the stashed decision. If skip, log and throw
 //                     a sentinel error so the host aborts this turn. (See note
 //                     below on why we throw.)
@@ -63,12 +69,32 @@
 // module stays the same.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type {
-  PluginHookInboundClaimContext,
-  PluginHookInboundClaimEvent,
-  PluginHookInboundClaimResult,
-} from 'openclaw/plugin-sdk/plugin-entry';
 import { runLarkCliJson } from '../lib/lark-shell.js';
+
+// `message_received` event/ctx types live in the SDK but are NOT re-exported
+// from `openclaw/plugin-sdk/plugin-entry`. We declare just the fields we touch
+// so we don't depend on a private import path. Shape mirrors
+// hook-message.types.d.ts (PluginHookMessageReceivedEvent / PluginHookMessageContext).
+type PluginHookMessageReceivedEvent = {
+  from: string;
+  content: string;
+  timestamp?: number;
+  threadId?: string | number;
+  messageId?: string;
+  senderId?: string;
+  sessionKey?: string;
+  runId?: string;
+  metadata?: Record<string, unknown>;
+};
+type PluginHookMessageContext = {
+  channelId: string;
+  accountId?: string;
+  conversationId?: string;
+  sessionKey?: string;
+  runId?: string;
+  messageId?: string;
+  senderId?: string;
+};
 
 // `before_prompt_build` event/result types are declared in the SDK but NOT
 // re-exported from `openclaw/plugin-sdk/plugin-entry`. We declare just the
@@ -90,6 +116,39 @@ const GATE_NAMESPACE = 'reply-gate';
 /** Tag used on sentinel errors so the orchestrator (or future hook chain)
  *  can distinguish a deliberate skip from a real bug. */
 export const GATE_SKIP_SENTINEL_TAG = 'FEISHU_COLLAB_GATE_SKIP';
+
+/**
+ * In-memory bridge from `message_received` → `before_prompt_build`.
+ *
+ * Why not setRunContext? The host fires `message_received` BEFORE a run is
+ * registered, so `ctx.runId` / `event.runId` are undefined at that point —
+ * setRunContext silently no-ops. Using sessionKey (which IS populated on
+ * both hooks) we get a stable cross-hook key. Entries are short-lived
+ * (cleared on read or after 5 minutes).
+ */
+type PendingGate = {
+  decision: GateDecision;
+  ts: number;
+};
+const pendingGateBySession = new Map<string, PendingGate>();
+const GATE_PENDING_TTL_MS = 5 * 60_000;
+
+function setPendingGate(sessionKey: string, decision: GateDecision): void {
+  if (!sessionKey) return;
+  pendingGateBySession.set(sessionKey, { decision, ts: Date.now() });
+}
+function consumePendingGate(sessionKey: string | undefined): GateDecision | undefined {
+  if (!sessionKey) return undefined;
+  // Opportunistic TTL sweep.
+  const now = Date.now();
+  for (const [k, v] of pendingGateBySession) {
+    if (now - v.ts > GATE_PENDING_TTL_MS) pendingGateBySession.delete(k);
+  }
+  const entry = pendingGateBySession.get(sessionKey);
+  if (!entry) return undefined;
+  pendingGateBySession.delete(sessionKey);
+  return entry.decision;
+}
 
 export type GateMode = 'mention-only' | 'autonomous';
 
@@ -224,51 +283,54 @@ function extractBotOpenId(raw: unknown): string | null {
 }
 
 /**
- * Extract mentions from the inbound_claim event. The SDK type only declares
- * `metadata?: Record<string, unknown>` and a top-level `wasMentioned?` flag;
- * the feishu channel populates `metadata.mentions` (an array of open_id
- * strings) and/or the raw event object on `metadata.raw`.
+ * Extract mentions from a `message_received` event's content. Feishu's
+ * canonical text content for a group message that @-mentions a bot is e.g.:
  *
- * We prefer the structured array; we fall back to raw scanning so this still
- * works if the channel plugin evolves its metadata shape.
+ *   '<at user_id="ou_abc123def456..."></at> what time is the meeting?'
+ *
+ * We parse the open_ids out by regex. Open IDs always start with `ou_` and
+ * are roughly 28-44 hex/alphanum chars, but we accept anything inside the
+ * user_id attribute.
  */
-function extractMentions(event: PluginHookInboundClaimEvent): string[] {
-  const meta = event.metadata ?? {};
-  const direct = (meta as { mentions?: unknown }).mentions;
-  if (Array.isArray(direct)) {
-    const out: string[] = [];
-    for (const m of direct) {
-      if (typeof m === 'string') out.push(m);
-      else if (m && typeof m === 'object') {
-        const idObj = (m as { id?: unknown; open_id?: unknown }).open_id ??
-          ((m as { id?: { open_id?: unknown } }).id?.open_id);
-        if (typeof idObj === 'string') out.push(idObj);
-      }
-    }
-    if (out.length) return out;
+function extractMentionsFromContent(content: string | undefined): string[] {
+  if (!content || typeof content !== 'string') return [];
+  const out: string[] = [];
+  const re = /<at\s+user_id="([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    if (m[1]) out.push(m[1]);
   }
-  // Fallback: scan raw event payload for "@_user_N" style mention ids' open_id.
-  const raw = (meta as { raw?: unknown }).raw;
-  if (raw && typeof raw === 'object') {
-    const message = (raw as { message?: { mentions?: unknown } }).message;
-    if (message && Array.isArray(message.mentions)) {
-      const out: string[] = [];
-      for (const m of message.mentions) {
-        const idObj = (m as { id?: { open_id?: unknown } | string })?.id;
-        if (typeof idObj === 'string') out.push(idObj);
-        else if (idObj && typeof idObj === 'object' && typeof (idObj as { open_id?: unknown }).open_id === 'string') {
-          out.push((idObj as { open_id: string }).open_id);
-        }
-      }
-      return out;
-    }
-  }
-  return [];
+  return out;
 }
 
 /**
- * Compute the gate decision from an inbound_claim event.
+ * Best-effort `isGroup` inference from the message context. Feishu group chat
+ * IDs always start with `oc_` (open chat). P2P "chats" use the peer's open_id
+ * (`ou_…`) as the conversation key. The host may prefix the ID with
+ * `chat:` (or `channel:` etc.) for routing — we strip those before checking.
+ * If conversationId is missing we fall back to false (= treat as p2p /
+ * non-group, which then bypasses the gate via the `p2p-bypass` branch).
+ */
+function inferIsGroup(conversationId: string | undefined): boolean {
+  if (typeof conversationId !== 'string') return false;
+  const stripped = stripChannelPrefix(conversationId);
+  return stripped.startsWith('oc_');
+}
+
+function stripChannelPrefix(value: string): string {
+  for (const prefix of ['channel:', 'chat:', 'user:', 'feishu:']) {
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
+  }
+  return value;
+}
+
+/**
+ * Compute the gate decision from a message_received event.
  * Pure function, no I/O — useful for unit testing if/when QA wires it up.
+ *
+ * `wasMentioned` is no longer a host-provided flag (the message_received event
+ * doesn't carry it); callers should derive it from `botOpenId ∈ mentions` and
+ * pass it in for callsite clarity. Field kept optional for back-compat.
  */
 export function computeGateDecision(opts: {
   isGroup: boolean;
@@ -303,75 +365,102 @@ export function computeGateDecision(opts: {
  *
  * Wiring contract for the orchestrator:
  *   - Call `register(api)` once during plugin `register()`.
- *   - When `inbound_claim` fires, this module records the decision into
- *     run context but returns `undefined` (does NOT claim the message — that
- *     belongs to Module A).
+ *   - When `message_received` fires, this module records the decision into
+ *     run context but does not claim the message (it's a void hook anyway).
  *   - When `before_prompt_build` fires, this module reads the decision and
  *     either returns void (reply) or throws GateSkipSignal (skip).
+ *
+ * Capture log:
+ *   We also emit a `[feishu-collab] capture chat=… sender=… mentions=…` line
+ *   on every message_received so the harness can verify Module B sees ALL
+ *   inbound messages pre-mention-gate (the smoke test for Scenario A).
  */
 export function register(api: GateApi): void {
-  const inboundClaimHandler = async (
-    event: PluginHookInboundClaimEvent,
-    ctx: PluginHookInboundClaimContext,
-  ): Promise<PluginHookInboundClaimResult | void> => {
+  const messageReceivedHandler = async (
+    event: PluginHookMessageReceivedEvent,
+    ctx: PluginHookMessageContext,
+  ): Promise<void> => {
     try {
       const mode = readGateMode(api);
-      const mentions = extractMentions(event);
+      const conversationId = ctx?.conversationId;
+      const mentions = extractMentionsFromContent(event?.content);
       const botOpenId = await getBotOpenId();
+      const isGroup = inferIsGroup(conversationId);
+
+      // Mention detection. Feishu's host adapter normally hands us `content`
+      // as `BodyForCommands` — already stripped of `<at>` markup — which
+      // means content-scanning can return zero mentions even when the bot
+      // WAS @-ed. Mitigation: in feishu groups the host only fires
+      // `message_received` for messages already filtered by the
+      // server-side mention gate; if we get this far in a group, we are
+      // safe to assume we were mentioned. We still prefer the explicit
+      // signal when content carries it.
+      const isFeishu =
+        (ctx?.channelId ?? '').toLowerCase() === 'feishu' ||
+        (event?.metadata as { provider?: string } | undefined)?.provider === 'feishu';
+      const wasMentioned =
+        (botOpenId !== null && mentions.includes(botOpenId)) ||
+        (isGroup && isFeishu);
+
+      // Observability: every inbound message we see, log once. Useful for
+      // verifying message_received actually fires pre-mention-gate.
+      log(
+        api,
+        'info',
+        `capture chat=${conversationId ?? '?'} sender=${event?.senderId ?? '?'} mentions=${mentions.length} content-len=${event?.content?.length ?? 0}`,
+      );
+
       const decision = computeGateDecision({
-        isGroup: !!event.isGroup,
+        isGroup,
         mode,
         mentions,
         botOpenId,
-        wasMentioned: event.wasMentioned,
+        wasMentioned,
       });
 
-      // Stash for before_prompt_build to read. Keyed by runId so we don't
-      // bleed decisions across concurrent runs.
-      const runId = ctx.runId ?? event.runId;
+      // Stash for before_prompt_build to read. Keyed by sessionKey since
+      // runId isn't assigned yet at message_received time (the run is
+      // registered downstream during dispatch).
+      const sessionKey = ctx?.sessionKey ?? event?.sessionKey;
+      if (sessionKey) {
+        setPendingGate(sessionKey, decision);
+      }
+      // Best-effort: also try setRunContext if a runId IS present (some
+      // host paths populate it earlier — harmless when absent).
+      const runId = ctx?.runId ?? event?.runId;
       if (runId) {
-        const ok = api.setRunContext({
+        api.setRunContext({
           runId,
           namespace: GATE_NAMESPACE,
           value: { decision } satisfies RunGateState,
           mergeStrategy: 'replace',
         });
-        if (!ok) {
-          // Run context write failed (e.g. run not yet registered). We still
-          // log the decision so we have observability; before_prompt_build
-          // will recompute on the fly.
-          log(
-            api,
-            'warn',
-            `gate-decision-deferred (setRunContext returned false) decision=${decision.outcome} reason=${decision.reason}`,
-          );
-        }
       }
       log(api, 'info', `gate-decision: ${decision.outcome} (reason=${decision.reason})`);
     } catch (err) {
-      // Never let the gate's bookkeeping crash inbound_claim — Module A still
-      // needs to capture this message. Fall through to "no decision recorded";
+      // Never let the gate's bookkeeping crash message_received — Module C
+      // also keys off this hook. Fall through to "no decision recorded";
       // before_prompt_build will treat that as "reply" so we err on the side
       // of responsiveness.
       log(api, 'warn', `gate-decision-error: ${(err as Error).message}`);
     }
-    return undefined;
   };
 
   const beforePromptBuildHandler = async (
     _event: PluginHookBeforePromptBuildEvent,
-    ctx: { runId?: string },
+    ctx: { runId?: string; sessionKey?: string },
   ): Promise<PluginHookBeforePromptBuildResult | void> => {
-    const runId = ctx?.runId;
     let decision: GateDecision | undefined;
-    if (runId) {
-      const stored = api.getRunContext<RunGateState>({ runId, namespace: GATE_NAMESPACE });
+    if (ctx?.sessionKey) {
+      decision = consumePendingGate(ctx.sessionKey);
+    }
+    if (!decision && ctx?.runId) {
+      const stored = api.getRunContext<RunGateState>({ runId: ctx.runId, namespace: GATE_NAMESPACE });
       decision = stored?.decision;
     }
     if (!decision) {
-      // No inbound_claim ran for this run (e.g. CLI-triggered or non-feishu
-      // surface). Conservative: allow the reply. Module A is the source of
-      // truth for "is this a feishu group event".
+      // No message_received decision recorded (e.g. CLI-triggered or
+      // non-feishu surface, or race lost). Conservative: allow the reply.
       return undefined;
     }
     if (decision.outcome === 'skip') {
@@ -383,7 +472,7 @@ export function register(api: GateApi): void {
     return undefined;
   };
 
-  api.on('inbound_claim', inboundClaimHandler);
+  api.on('message_received', messageReceivedHandler);
   api.on('before_prompt_build', beforePromptBuildHandler);
 }
 

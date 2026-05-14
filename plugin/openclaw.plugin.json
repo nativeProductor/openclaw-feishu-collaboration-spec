@@ -48,18 +48,40 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "atBack": { "type": "boolean", "default": true, "description": "Auto @-mention the originating bot in replies." },
-          "loopMaxDepth": {
-            "type": "number",
-            "default": 5,
-            "minimum": 1,
-            "maximum": 20,
-            "description": "After this many consecutive bot-bot turns, drop the @-back so the conversation fades. Hard-skip past N+1 turns."
+          "atBackHumans": {
+            "type": "boolean",
+            "default": true,
+            "description": "Prepend an @-mention of the originating user to replies in groups."
           },
-          "softHintAtDepth": {
-            "type": "number",
-            "default": 3,
-            "description": "Inject 'consider wrapping up' system-prompt hint starting at this depth."
+          "atBackBots": {
+            "type": "boolean",
+            "default": true,
+            "description": "Prepend an @-mention of the originating peer bot to replies in groups."
+          },
+          "loopGuard": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Master switch for the graduated brake on bot-bot chains."
+              },
+              "maxDepth": {
+                "type": "integer",
+                "default": 5,
+                "minimum": 1,
+                "maximum": 20,
+                "description": "At this depth the @-back is dropped; the next turn is hard-skipped so the conversation fades."
+              },
+              "softHintAtDepth": {
+                "type": "integer",
+                "default": 3,
+                "minimum": 1,
+                "maximum": 20,
+                "description": "Depth at which the first soft 'consider wrapping up' hint is injected; the stronger hint fires at softHintAtDepth+1."
+              }
+            }
           }
         }
       }

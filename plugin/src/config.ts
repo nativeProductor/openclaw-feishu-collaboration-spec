@@ -28,9 +28,15 @@ export const FeishuCollabConfig = Type.Object({
 
   crossBot: Type.Optional(
     Type.Object({
-      atBack: Type.Optional(Type.Boolean()),
-      loopMaxDepth: Type.Optional(Type.Number()),
-      softHintAtDepth: Type.Optional(Type.Number()),
+      atBackHumans: Type.Optional(Type.Boolean()),
+      atBackBots: Type.Optional(Type.Boolean()),
+      loopGuard: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          maxDepth: Type.Optional(Type.Number()),
+          softHintAtDepth: Type.Optional(Type.Number()),
+        }),
+      ),
     }),
   ),
 });
