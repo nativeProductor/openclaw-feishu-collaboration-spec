@@ -297,6 +297,38 @@ expected (over a multi-turn dialogue):
   - bot2 reply references content from > context_window ago via semantic recall
 ```
 
+#### C-2 vision (P0, Phase 1)
+
+Bot must handle inbound messages containing images. When an image is
+attached and the bot is @-mentioned, the plugin fetches the binary via
+`im:resource` and switches to a vision-capable model per-turn (e.g.
+`xiaomi/mimo-v2-omni`); text-only models (e.g. `mimo-v2.5-pro`) continue
+to serve normal turns.
+
+```yaml
+id: C-2.1
+module: C
+title: image + @-mention → vision fetch + per-turn vision-model reply
+preconditions:
+  - bot2's app has `im:resource` scope granted
+  - models.providers.xiaomi.models includes 'mimo-v2-omni' (input: ['text','image'])
+  - feishu-collab config: vision.enabled=true (or default), vision.model='xiaomi/mimo-v2-omni'
+steps:
+  - send_as: bot1
+    msg_type: image+text
+    text: '<at user_id="$OPEN_ID_BOT2"></at> 描述一下这张图'
+    image: ./fixtures/cat.jpg
+  - wait_for: 'bot2 DISP-E'
+expected:
+  - '[feishu-collab] vision-fetch ok message_id=<id> file_key=<key> bytes=<n>'
+  - '[feishu-collab] vision model-override applied model=xiaomi/mimo-v2-omni'
+  - 'bot2 DISP-E queuedFinal=true replies=1'
+  - bot2 reply text references concrete image content (e.g. mentions 'cat'/'猫')
+must_not_log:
+  - 'vision-fetch failed'
+  - any stack trace
+```
+
 ### Module U — Universality (zero-topology, install-and-go)
 
 **Hard product invariant (locked by product owner):** the plugin must work on **any** OpenClaw bot in **any** Feishu group with **zero** per-chat or per-bot configuration. No `chat_id` / `open_id` / `app_id` lists may appear in config; everything is runtime-discovered.
@@ -715,6 +747,7 @@ Blocking deliverables — please confirm before sprint exit:
 | C-1.4 | C      | no inject on skip                                                |
 | C-1.5 | C      | fetch failure degrades gracefully                                |
 | C-1.6 | C      | memory-core source                                               |
+| C-2.1 | C      | image + @-mention → vision fetch + per-turn vision-model reply    |
 | U-1   | U      | brand-new bot in brand-new group works without config touch       |
 | U-2   | U      | chat membership discovery is runtime + cached per chat            |
 | U-3   | U      | zero-topology invariant — config diff stays empty after U-1       |
@@ -742,4 +775,4 @@ Blocking deliverables — please confirm before sprint exit:
 | P-4   | P      | no memory leak over 200 msgs                                     |
 | P-5   | P      | log volume sane                                                  |
 
-Total: 41 cases (9 B, 6 C, 6 D, 6 U, 9 N, 5 P).
+Total: 42 cases (9 B, 7 C, 6 D, 6 U, 9 N, 5 P).

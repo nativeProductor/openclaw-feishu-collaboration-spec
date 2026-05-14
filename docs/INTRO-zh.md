@@ -170,7 +170,7 @@ EOF
 `openclaw plugins uninstall openclaw-feishu-collaboration-spec` 即可移除插件本体;数据文件在 `~/.openclaw-<profile>/state/feishu-collab/` 下,手动删除即可,OpenClaw 主流程不依赖它们。
 
 **Q:支不支持视觉/图片?**
-v0.1 发布时,图片消息按 `[图片]` 标记入库;完整 vision 支持(走 `im:resource` 拉二进制 + 多模态 prompt 块,必要时 per-turn 切换到 vision 模型)在路线图上。
+v0.1 支持图片输入 —— 当消息含图时,plugin 通过 Feishu `im:resource` API 拉取图片二进制,在 prompt 中加多模态 block,并 per-turn 切换到 vision 模型(如 `xiaomi/mimo-v2-omni`)。文本模型(如 `mimo-v2.5-pro`)继续用于无图回话。
 
 ## 相关链接
 
