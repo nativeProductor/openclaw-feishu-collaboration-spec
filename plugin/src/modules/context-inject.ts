@@ -49,14 +49,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type {
-  PluginHookBeforePromptBuildEvent,
-  PluginHookBeforePromptBuildResult,
   PluginHookInboundClaimContext,
   PluginHookInboundClaimEvent,
   PluginHookInboundClaimResult,
 } from 'openclaw/plugin-sdk/plugin-entry';
 import { LarkShellError, runLarkCliJson } from '../lib/lark-shell.js';
 import { getBotOpenId } from './reply-gate.js';
+
+// `before_prompt_build` event/result types live in the SDK but aren't
+// re-exported from `openclaw/plugin-sdk/plugin-entry`. We declare the fields
+// we touch so we don't reach into a private import path.
+type PluginHookBeforePromptBuildEvent = {
+  prompt: string;
+  messages: unknown[];
+};
+type PluginHookBeforePromptBuildResult = {
+  systemPrompt?: string;
+  prependContext?: string;
+  appendContext?: string;
+  prependSystemContext?: string;
+  appendSystemContext?: string;
+};
 
 const LOG_PREFIX = '[feishu-collab]';
 const CONTEXT_NAMESPACE = 'context-inject';
