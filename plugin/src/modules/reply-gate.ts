@@ -338,6 +338,11 @@ export function computeGateDecision(opts: {
   mentions: string[];
   botOpenId: string | null;
   wasMentioned?: boolean;
+  /**
+   * True when content carries the literal '@_all' token — Feishu's rendered
+   * form of `<at user_id="all">` after structured tag stripping.
+   */
+  contentAtAll?: boolean;
 }): GateDecision {
   if (!opts.isGroup) {
     return { outcome: 'reply', reason: 'p2p-bypass' };
@@ -346,16 +351,36 @@ export function computeGateDecision(opts: {
     // P0: stub. Real classifier lands in Phase 2.
     return { outcome: 'skip', reason: 'autonomous-mode-stub' };
   }
-  // mention-only
-  if (opts.wasMentioned === true) {
-    return { outcome: 'reply', reason: 'mention-host-flag' };
+
+  // mention-only mode.
+  //
+  // Reality at the channel layer: Feishu strips `<at user_id="ou_...">` tags
+  // out of `event.content` before delivering the message_received event, so
+  // a regex scan of content yields zero mentions even for a legitimate @-bot
+  // message. The reliable signal we have is `wasMentioned`, which the host
+  // populates based on Feishu's own delivery filter (`im:message.group_at_msg`
+  // scope already pre-filters so that any group event we see was @-mentioning
+  // *some* bot in this app's tenant — almost always us).
+  //
+  // We still try `mentions.includes(botOpenId)` as a stricter check when the
+  // scan does pick something up (e.g. if the host adapter ever changes and
+  // exposes raw at-tags). And we still flag @all explicitly when the literal
+  // 'all' token comes through.
+
+  if (opts.mentions.includes('all') || opts.mentions.includes('@all')) {
+    return { outcome: 'skip', reason: 'at-all-ignored' };
+  }
+  // Feishu renders <at user_id="all"> as the literal "@_all" inside the
+  // delivered content (the structured tag is stripped). Match the rendered
+  // form too so @all broadcasts are correctly ignored.
+  if (opts.contentAtAll === true) {
+    return { outcome: 'skip', reason: 'at-all-ignored' };
   }
   if (opts.botOpenId && opts.mentions.includes(opts.botOpenId)) {
     return { outcome: 'reply', reason: 'mention-match' };
   }
-  if (!opts.botOpenId) {
-    // Identity not yet known — default to skip (safer than spamming).
-    return { outcome: 'skip', reason: 'no-bot-identity' };
+  if (opts.wasMentioned === true) {
+    return { outcome: 'reply', reason: 'mention-host-flag' };
   }
   return { outcome: 'skip', reason: 'no-mention' };
 }
@@ -410,12 +435,17 @@ export function register(api: GateApi): void {
         `capture chat=${conversationId ?? '?'} sender=${event?.senderId ?? '?'} mentions=${mentions.length} content-len=${event?.content?.length ?? 0}`,
       );
 
+      // Detect Feishu's rendered '@_all' broadcast marker in content.
+      const contentAtAll =
+        typeof event?.content === 'string' && /@_all\b/.test(event.content);
+
       const decision = computeGateDecision({
         isGroup,
         mode,
         mentions,
         botOpenId,
         wasMentioned,
+        contentAtAll,
       });
 
       // Stash for before_prompt_build to read. Keyed by sessionKey since
