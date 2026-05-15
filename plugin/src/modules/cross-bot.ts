@@ -59,6 +59,10 @@ import {
   getLoopStateStore,
   getPendingHintRegistry,
 } from '../lib/state.js';
+import {
+  getBotOpenIdsInChat,
+  peekBotOpenIdsInChat,
+} from '../lib/feishu-members.js';
 
 const LOG_PREFIX = '[feishu-collab]';
 
@@ -258,6 +262,71 @@ function resolveInboundSummary(event: unknown, ctx: unknown): InboundSummary {
 }
 
 /**
+ * Enrich a summary's `senderType` field by checking the chat's bot membership.
+ *
+ * OpenClaw's `message_received` doesn't pass `sender_type` through, so we
+ * derive it from `getBotOpenIdsInChat(chatId).has(senderOpenId)`. Returns a
+ * new summary with `senderType` filled in if we could classify; otherwise the
+ * original summary unchanged.
+ *
+ * Also re-writes the cached entry in `inboundBySession` so subsequent hook
+ * fires (llm_output, agent_end) see the enriched value.
+ *
+ * Sync-fast path: peek the cache first to avoid a child_process spawn in the
+ * common hot loop. Only fall back to the async fetch if the chat hasn't been
+ * looked up yet.
+ */
+async function enrichSenderType(
+  summary: InboundSummary,
+  sessionKey: string | undefined,
+): Promise<InboundSummary> {
+  if (!summary.chatId || !summary.senderOpenId) return summary;
+  // Already known? trust it.
+  if (summary.senderType === 'app' || summary.senderType === 'user') return summary;
+
+  let bots = peekBotOpenIdsInChat(summary.chatId);
+  if (!bots) {
+    try {
+      bots = await getBotOpenIdsInChat(summary.chatId);
+    } catch {
+      // Already swallowed inside getBotOpenIdsInChat — defensive.
+      return summary;
+    }
+  }
+  if (!bots) return summary;
+
+  const isBot = bots.has(summary.senderOpenId);
+  const inferredType: 'app' | 'user' = isBot ? 'app' : 'user';
+  // If we're saying "app" but peerAppId is empty, we still don't know the
+  // peer's app_id (the members endpoint returns bot_id=open_id but not
+  // app_id). That's OK — the brake is keyed on (chat_id, peerAppId), and we
+  // can synthesize a deterministic peer key from the open_id when no app_id
+  // is available. Keep peerAppId empty here and let the caller decide.
+  const enriched: InboundSummary = {
+    ...summary,
+    senderType: inferredType,
+  };
+  if (sessionKey) {
+    const cached = inboundBySession.get(sessionKey);
+    if (cached) cached.summary = enriched;
+    else setPendingInbound(sessionKey, enriched);
+  }
+  return enriched;
+}
+
+/**
+ * Derive a stable peer-key for the loop state store. Prefers the real
+ * peer app_id; falls back to a deterministic prefix of the peer's open_id
+ * when the event payload didn't include app_id (the common case under
+ * `message_received` — the chats/members/bots API gives us open_ids only).
+ */
+function derivePeerKey(summary: InboundSummary): string {
+  if (summary.peerAppId) return summary.peerAppId;
+  if (summary.senderOpenId) return `openid:${summary.senderOpenId}`;
+  return '';
+}
+
+/**
  * Build the `<at>` prefix for an open_id. Feishu rich-text accepts
  * `<at user_id="ou_xxxx"></at>` to render an @-mention.
  */
@@ -453,14 +522,21 @@ export function register(api: PluginApi): void {
     const summary = parseInboundSummary(event, ctx);
     if (!summary.chatId && !summary.senderOpenId) return undefined;
     setPendingInbound(sessionKey, summary);
-    // Note: OpenClaw's message_received event does NOT carry `sender_type` —
-    // metadata exposes {to, provider, surface, originatingChannel, messageId,
-    // senderId, senderName} but no user-vs-app discriminator. To distinguish
-    // human from bot peers we'd need to either (a) cache `im.v1.chats.members.bots`
-    // per chat, (b) lookup via `messages-mget` per message, or (c) hit
-    // contact/v3/users and treat 41050 as "is a bot". TODO for the bot-bot
-    // brake; currently we treat unknown sender_type as human (no brake), which
-    // is the safe default. The @-back rewrite still works in both cases.
+    // OpenClaw's `message_received` event metadata does NOT carry `sender_type`
+    // (see `toPluginMessageReceivedEvent` in message-hook-mappers — only
+    // `to, provider, surface, senderId, senderName, …` are passed through).
+    // We enrich by looking up the chat's bot members via
+    // `im/v1/chats/{chat_id}/members/bots` and matching the inbound sender
+    // open_id. Fire-and-forget — the result is cached so the next hook
+    // (`before_prompt_build`) sees the enriched summary synchronously.
+    void enrichSenderType(summary, sessionKey).then((enriched) => {
+      if (enriched.senderType !== summary.senderType) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `${LOG_PREFIX} cross-bot sender-type-resolved chat=${enriched.chatId} sender=${enriched.senderOpenId} type=${enriched.senderType}`,
+        );
+      }
+    });
     // eslint-disable-next-line no-console
     console.log(
       `${LOG_PREFIX} cross-bot inbound-cached chat=${summary.chatId} sender=${summary.senderOpenId || '?'} type=${summary.senderType || '?'}`,
@@ -471,10 +547,16 @@ export function register(api: PluginApi): void {
   // ---- before_prompt_build: read depth, decide skip/hint, mark drop-@ ----
   api.on('before_prompt_build', async (event: unknown, ctx?: unknown) => {
     const cfg = readConfig(readPluginCfgFromCtx(ctx));
-    const summary = resolveInboundSummary(event, ctx);
+    let summary = resolveInboundSummary(event, ctx);
 
     // Only operate in group chats. P2P has no loop dynamics.
     if (!isGroupChat(summary)) return undefined;
+
+    // Enrich sender_type if message_received didn't populate it. Cheap when
+    // the bot-members cache is warm; one lark-cli call on a cold chat.
+    if (summary.senderType !== 'app' && summary.senderType !== 'user') {
+      summary = await enrichSenderType(summary, readSessionKey(event, ctx));
+    }
 
     // Defensive self-check — never @-mention or chain against ourselves.
     const ownAppId = readOwnAppId(ctx);
@@ -483,17 +565,18 @@ export function register(api: PluginApi): void {
     }
 
     // Only the bot-bot case engages the graduated brake. Human inbound: nop.
-    if (!isBotSender(summary) || !summary.peerAppId || !summary.chatId) {
+    const peerKey = derivePeerKey(summary);
+    if (!isBotSender(summary) || !peerKey || !summary.chatId) {
       return undefined;
     }
 
-    const storedDepth = store.getDepth(summary.chatId, summary.peerAppId);
+    const storedDepth = store.getDepth(summary.chatId, peerKey);
     const decision = decideBrake(storedDepth, cfg);
 
     if (decision.skip) {
       // eslint-disable-next-line no-console
       console.log(
-        `${LOG_PREFIX} cross-bot hard-skip depth=${decision.nextD}`,
+        `${LOG_PREFIX} cross-bot hard-skip depth=${decision.nextD} peer=${peerKey}`,
       );
       // Signal skip back to the host. We return an object the host can
       // consult; we also try the common boolean shape just in case.
@@ -503,12 +586,12 @@ export function register(api: PluginApi): void {
     if (decision.dropAt) {
       // eslint-disable-next-line no-console
       console.log(
-        `${LOG_PREFIX} cross-bot drop-at depth=${decision.nextD}`,
+        `${LOG_PREFIX} cross-bot drop-at depth=${decision.nextD} peer=${peerKey}`,
       );
       // Stash a marker the outbound-rewrite hook will read.
       hints.set(
         summary.chatId,
-        dropAtBackKey(summary.chatId, summary.peerAppId),
+        dropAtBackKey(summary.chatId, peerKey),
         '1',
       );
     }
@@ -516,11 +599,11 @@ export function register(api: PluginApi): void {
     if (decision.hint) {
       // eslint-disable-next-line no-console
       console.log(
-        `${LOG_PREFIX} cross-bot soft-hint depth=${decision.nextD}`,
+        `${LOG_PREFIX} cross-bot soft-hint depth=${decision.nextD} peer=${peerKey}`,
       );
       injectSystemHint(event, decision.hint);
       // Also stash for any handler that prefers pull semantics.
-      hints.set(summary.chatId, summary.peerAppId, decision.hint);
+      hints.set(summary.chatId, peerKey, decision.hint);
     }
 
     return undefined;
@@ -529,10 +612,16 @@ export function register(api: PluginApi): void {
   // ---- llm_output: rewrite outbound text to prepend @-back ----
   api.on('llm_output', async (event: unknown, ctx?: unknown) => {
     const cfg = readConfig(readPluginCfgFromCtx(ctx));
-    const summary = resolveInboundSummary(event, ctx);
+    let summary = resolveInboundSummary(event, ctx);
 
     if (!isGroupChat(summary)) return undefined;
     if (!summary.senderOpenId) return undefined;
+
+    // Enrich sender_type (the cache populated in message_received usually
+    // resolves before this fires; otherwise this is a single API call).
+    if (summary.senderType !== 'app' && summary.senderType !== 'user') {
+      summary = await enrichSenderType(summary, readSessionKey(event, ctx));
+    }
 
     // Self-check.
     const ownAppId = readOwnAppId(ctx);
@@ -546,10 +635,11 @@ export function register(api: PluginApi): void {
     if (!senderIsBot && !cfg.atBackHumans) return undefined;
 
     // Honor depth-5 drop-@ decision recorded earlier.
-    if (senderIsBot && summary.peerAppId) {
+    const peerKey = derivePeerKey(summary);
+    if (senderIsBot && peerKey) {
       const drop = hints.consume(
         summary.chatId,
-        dropAtBackKey(summary.chatId, summary.peerAppId),
+        dropAtBackKey(summary.chatId, peerKey),
       );
       if (drop) return undefined; // Reply goes out plain.
     }
@@ -575,9 +665,14 @@ export function register(api: PluginApi): void {
   // The cache is bounded by INBOUND_CACHE_MAX (LRU-ish eviction on overflow),
   // so leaving entries is safe and bounded.
   api.on('agent_end', async (event: unknown, ctx?: unknown) => {
-    const summary = resolveInboundSummary(event, ctx);
+    let summary = resolveInboundSummary(event, ctx);
 
     if (!isGroupChat(summary) || !summary.chatId) return undefined;
+
+    // Enrich sender_type so we don't mistakenly reset on a bot turn.
+    if (summary.senderType !== 'app' && summary.senderType !== 'user') {
+      summary = await enrichSenderType(summary, readSessionKey(event, ctx));
+    }
 
     // Self-check.
     const ownAppId = readOwnAppId(ctx);
@@ -597,11 +692,12 @@ export function register(api: PluginApi): void {
     }
 
     // Bot inbound that we just replied to → bump depth.
-    if (summary.peerAppId) {
-      const newDepth = store.bumpDepth(summary.chatId, summary.peerAppId);
+    const peerKey = derivePeerKey(summary);
+    if (peerKey) {
+      const newDepth = store.bumpDepth(summary.chatId, peerKey);
       // eslint-disable-next-line no-console
       console.log(
-        `${LOG_PREFIX} cross-bot depth bump chat=${summary.chatId} peer=${summary.peerAppId} depth=${newDepth}`,
+        `${LOG_PREFIX} cross-bot depth bump chat=${summary.chatId} peer=${peerKey} depth=${newDepth}`,
       );
     }
     return undefined;
