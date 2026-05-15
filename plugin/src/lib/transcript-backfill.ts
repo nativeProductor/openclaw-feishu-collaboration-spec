@@ -17,6 +17,13 @@
  *   - Per-chat throttle (MIN_INTERVAL_MS) and in-flight dedup keep the API
  *     call rate proportional to inbound event rate, not multiplied by it.
  *
+ * Storage policy: every message returned by the REST endpoint is appended
+ * (subject to dedup) — including outbound replies authored by the host bot
+ * itself. Each Module D reply turn is a fresh, stateless agent invocation,
+ * so the model needs to see its own prior replies in the context block to
+ * stay coherent across turns (especially in bot-vs-bot conversations,
+ * where dropping own-outbound caused an empty-reply death spiral).
+ *
  * Why per-chat (not global): two different chats can race their own
  * backfills concurrently — they share no state. But two backfills for the
  * SAME chat would duplicate work and risk race-y appends, so we coalesce
@@ -120,7 +127,12 @@ function resolveSenderOpenId(sender: FeishuApiSender | undefined): string {
 }
 
 export interface BackfillOptions {
-  /** App_id of the running bot, used to skip our own outbound replies. */
+  /**
+   * Deprecated and ignored. Previously used to filter out the host bot's
+   * own outbound replies; we now store every message (including own
+   * outbound) so the stateless reply agent can see its own past turns.
+   * Kept in the type for backward compatibility with old callers.
+   */
   ownAppId?: string;
   /** Max API page size; default 30. */
   pageSize?: number;
@@ -187,7 +199,6 @@ export function backfillChatTranscript(
       for (const item of candidates) {
         const msgId = typeof item.message_id === 'string' ? item.message_id : '';
         if (!msgId || known.has(msgId)) continue;
-        if (opts.ownAppId && item.sender?.id === opts.ownAppId) continue;
         const ts = typeof item.create_time === 'string' ? Number(item.create_time) : NaN;
         if (!Number.isFinite(ts)) continue;
         const senderOpenId = resolveSenderOpenId(item.sender);

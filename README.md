@@ -98,7 +98,7 @@ Module C reads context from a local JSONL store that Module A populates as event
 
 Module A stores one JSONL file per chat under `~/.openclaw-<profile>/state/feishu-collab/transcripts/<chat_id>.jsonl`. Per-chat cap: **2000 entries**, rotated to the most recent 1333 on overflow via atomic temp+rename. There is intentionally no time-based TTL — a chat that goes quiet for months keeps its last 1333 entries, ready for whenever someone re-engages. Per-chat size sits around ~1 MB; 100 active chats fit in tens of MB.
 
-The store includes every message the plugin sees: humans (both @-mentioned and ambient), other bots (@-mentioned via WebSocket events; non-@ messages backfilled via REST), but **not** the host bot's own outbound replies (the model's session already has those as assistant turns; storing them in the context block would double-count).
+The store includes every message the plugin sees, including the host bot's own outbound replies — the model's reply turns are stateless, so showing the bot its own prior messages is needed for multi-turn coherence (e.g. bot-vs-bot conversations).
 
 ### Bot-to-bot loop guard
 

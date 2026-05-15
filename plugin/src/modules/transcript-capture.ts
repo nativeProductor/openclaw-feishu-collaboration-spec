@@ -28,7 +28,6 @@
 import { parseInboundSummary } from '../lib/feishu-payload.js';
 import { backfillChatTranscript } from '../lib/transcript-backfill.js';
 import { getTranscriptStore } from '../lib/transcript-store.js';
-import { getOwnAppId } from './reply-gate.js';
 
 const LOG_PREFIX = '[feishu-collab]';
 
@@ -91,12 +90,6 @@ function readMsgType(event: PluginHookMessageReceivedEvent): string {
   return 'text';
 }
 
-// Note on identity: we used to read app_id from `ctx` per hook fire, but
-// the OpenClaw `message_received` context doesn't reliably carry that
-// field — `ctx.botAppId` / `ctx.account.appId` were empty in practice.
-// We now use the module-scope cached `getOwnAppId()` which reads from
-// process.env or `~/.openclaw-<profile>/openclaw.json` once per process.
-
 export function register(api: CtxApi): void {
   const store = getTranscriptStore();
 
@@ -139,12 +132,12 @@ export function register(api: CtxApi): void {
       // missed. Off the reply hot path; per-chat throttled to one call
       // per ~3s. Never blocks event handling, never throws.
       //
-      // ownAppId from getOwnAppId() (module-scope cached) is used to
-      // filter out our own outbound replies; without this they leak into
-      // the transcript and Module C would inject them into the system
-      // prompt as if they were peer turns.
-      const ownAppId = getOwnAppId();
-      void backfillChatTranscript(summary.chatId, store, { ownAppId }).catch(() => {
+      // We intentionally do NOT pass ownAppId: each Module D reply turn
+      // is a fresh, stateless agent invocation, so the model needs to
+      // see its own past replies in the context block to stay coherent
+      // across turns (this dropped own-outbound previously and caused an
+      // empty-reply death spiral in bot-vs-bot conversations).
+      void backfillChatTranscript(summary.chatId, store).catch(() => {
         // backfillChatTranscript itself never throws; this catch is
         // belt-and-suspenders against any future signature drift.
       });
