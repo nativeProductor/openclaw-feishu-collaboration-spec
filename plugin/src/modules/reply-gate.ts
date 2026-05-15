@@ -1,4 +1,4 @@
-// Module B — Reply Gate (P0: mention-only mode).
+// Module B — Reply Gate (mention-only).
 //
 // Verify:
 //   1. Send no-@ msg in a group → log [feishu-collab] gate-decision: skip (reason=no-mention)
@@ -6,9 +6,8 @@
 //   2. Send @-bot msg in a group → log [feishu-collab] gate-decision: reply
 //                              → model runs normally
 //   3. Send p2p (1:1) msg       → log [feishu-collab] gate-decision: reply (reason=p2p-bypass)
-//   4. Switch gate.mode=autonomous → log [feishu-collab] gate-decision: skip (reason=autonomous-mode-stub)
-//                              → real autonomous behaviour lands in Phase 2
 //
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Why two hooks (message_received + before_prompt_build):
 //
@@ -68,6 +67,10 @@
 // switch `signalSkip()` to return that instead of throwing — the rest of the
 // module stays the same.
 // ─────────────────────────────────────────────────────────────────────────────
+
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import { runLarkCliJson } from '../lib/lark-shell.js';
 
@@ -150,7 +153,7 @@ function consumePendingGate(sessionKey: string | undefined): GateDecision | unde
   return entry.decision;
 }
 
-export type GateMode = 'mention-only' | 'autonomous';
+export type GateMode = 'mention-only';
 
 export type GateDecision = {
   outcome: 'reply' | 'skip';
@@ -219,13 +222,10 @@ function log(api: GateApi, level: 'info' | 'warn' | 'error', msg: string) {
   console.log(line);
 }
 
-function readGateMode(api: GateApi): GateMode {
-  const cfg = api.pluginConfig as
-    | { gate?: { mode?: string } | undefined }
-    | undefined;
-  const raw = cfg?.gate?.mode;
-  if (raw === 'autonomous') return 'autonomous';
-  // Default + any unknown value collapses to mention-only (safer).
+function readGateMode(_api: GateApi): GateMode {
+  // Only `mention-only` is supported. The field is kept on the config
+  // schema for future extensibility but currently always resolves to
+  // mention-only — unknown values are coerced silently.
   return 'mention-only';
 }
 
@@ -280,6 +280,55 @@ function extractBotOpenId(raw: unknown): string | null {
     if (typeof c === 'string' && c.length > 0) return c;
   }
   return null;
+}
+
+let cachedOwnAppId: string | null = null;
+
+/**
+ * Resolve the running bot's Feishu app_id (`cli_xxx`). Used by Module A's
+ * transcript backfill to filter out our own outbound replies from the API
+ * results (the messages we sent ourselves shouldn't pollute the transcript).
+ *
+ * Resolution order:
+ *   1. process.env.FEISHU_APP_ID / LARK_APP_ID (test/override hook)
+ *   2. `~/.openclaw-<profile>/openclaw.json` → channels.feishu.appId
+ *   3. '' (caller treats as "unknown" — no own-bot filtering)
+ *
+ * Cached module-scope; reads the config file at most once per process.
+ * Synchronous because Node's plugin loader runs in the same process as the
+ * gateway, so the file is always on local disk and tiny.
+ */
+export function getOwnAppId(): string {
+  if (cachedOwnAppId !== null) return cachedOwnAppId;
+  const fromEnv = process.env.FEISHU_APP_ID || process.env.LARK_APP_ID;
+  if (fromEnv) {
+    cachedOwnAppId = fromEnv;
+    return cachedOwnAppId;
+  }
+  try {
+    const home =
+      process.env.OPENCLAW_HOME ??
+      path.join(
+        os.homedir(),
+        process.env.OPENCLAW_PROFILE
+          ? `.openclaw-${process.env.OPENCLAW_PROFILE}`
+          : '.openclaw',
+      );
+    const configPath = path.join(home, 'openclaw.json');
+    const raw = fs.readFileSync(configPath, 'utf8');
+    const cfg = JSON.parse(raw) as {
+      channels?: { feishu?: { appId?: string } };
+    };
+    const id = cfg?.channels?.feishu?.appId;
+    if (typeof id === 'string' && id) {
+      cachedOwnAppId = id;
+      return cachedOwnAppId;
+    }
+  } catch {
+    // missing file / unparseable / no field — fall through to ''
+  }
+  cachedOwnAppId = '';
+  return cachedOwnAppId;
 }
 
 /**
@@ -338,24 +387,45 @@ export function computeGateDecision(opts: {
   mentions: string[];
   botOpenId: string | null;
   wasMentioned?: boolean;
+  /**
+   * True when content carries the literal '@_all' token — Feishu's rendered
+   * form of `<at user_id="all">` after structured tag stripping.
+   */
+  contentAtAll?: boolean;
 }): GateDecision {
   if (!opts.isGroup) {
     return { outcome: 'reply', reason: 'p2p-bypass' };
   }
-  if (opts.mode === 'autonomous') {
-    // P0: stub. Real classifier lands in Phase 2.
-    return { outcome: 'skip', reason: 'autonomous-mode-stub' };
+
+  // mention-only mode (the only supported mode).
+  //
+  // Reality at the channel layer: Feishu strips `<at user_id="ou_...">` tags
+  // out of `event.content` before delivering the message_received event, so
+  // a regex scan of content yields zero mentions even for a legitimate @-bot
+  // message. The reliable signal we have is `wasMentioned`, which the host
+  // populates based on Feishu's own delivery filter (`im:message.group_at_msg`
+  // scope already pre-filters so that any group event we see was @-mentioning
+  // *some* bot in this app's tenant — almost always us).
+  //
+  // We still try `mentions.includes(botOpenId)` as a stricter check when the
+  // scan does pick something up (e.g. if the host adapter ever changes and
+  // exposes raw at-tags). And we still flag @all explicitly when the literal
+  // 'all' token comes through.
+
+  if (opts.mentions.includes('all') || opts.mentions.includes('@all')) {
+    return { outcome: 'skip', reason: 'at-all-ignored' };
   }
-  // mention-only
-  if (opts.wasMentioned === true) {
-    return { outcome: 'reply', reason: 'mention-host-flag' };
+  // Feishu renders <at user_id="all"> as the literal "@_all" inside the
+  // delivered content (the structured tag is stripped). Match the rendered
+  // form too so @all broadcasts are correctly ignored.
+  if (opts.contentAtAll === true) {
+    return { outcome: 'skip', reason: 'at-all-ignored' };
   }
   if (opts.botOpenId && opts.mentions.includes(opts.botOpenId)) {
     return { outcome: 'reply', reason: 'mention-match' };
   }
-  if (!opts.botOpenId) {
-    // Identity not yet known — default to skip (safer than spamming).
-    return { outcome: 'skip', reason: 'no-bot-identity' };
+  if (opts.wasMentioned === true) {
+    return { outcome: 'reply', reason: 'mention-host-flag' };
   }
   return { outcome: 'skip', reason: 'no-mention' };
 }
@@ -376,6 +446,23 @@ export function computeGateDecision(opts: {
  *   inbound messages pre-mention-gate (the smoke test for Scenario A).
  */
 export function register(api: GateApi): void {
+  // Startup diagnostic: resolve bot identity now (fires the cached
+  // /bot/v3/info call) so a misconfiguration shows up at gateway boot with
+  // a clear log line — not later when the first user message goes unread.
+  // PM-P0-3: "missing scope failure is silent" was the original complaint.
+  void getBotOpenId().then((openId) => {
+    const appId = getOwnAppId();
+    if (openId) {
+      log(api, 'info', `bot identity resolved open_id=${openId}${appId ? ` app_id=${appId}` : ''}`);
+    } else {
+      log(
+        api,
+        'error',
+        'bot identity unresolved — lark-cli auth or im scopes missing; @-mention detection will degrade to mention-only group heuristic',
+      );
+    }
+  });
+
   const messageReceivedHandler = async (
     event: PluginHookMessageReceivedEvent,
     ctx: PluginHookMessageContext,
@@ -410,12 +497,17 @@ export function register(api: GateApi): void {
         `capture chat=${conversationId ?? '?'} sender=${event?.senderId ?? '?'} mentions=${mentions.length} content-len=${event?.content?.length ?? 0}`,
       );
 
+      // Detect Feishu's rendered '@_all' broadcast marker in content.
+      const contentAtAll =
+        typeof event?.content === 'string' && /@_all\b/.test(event.content);
+
       const decision = computeGateDecision({
         isGroup,
         mode,
         mentions,
         botOpenId,
         wasMentioned,
+        contentAtAll,
       });
 
       // Stash for before_prompt_build to read. Keyed by sessionKey since

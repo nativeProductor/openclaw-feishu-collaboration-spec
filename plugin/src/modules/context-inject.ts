@@ -14,15 +14,29 @@
 //   5. corpus-supplement is registered exactly once at plugin load (P1.5 stub).
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// Data source today: lark-cli on-demand fetch only.
+// Data sources (in priority order):
 //
-// Module A's transcript SQLite store is still under research (the inbound_claim
-// scope question — see docs/architecture.md). Until it lands, we fetch on every
-// reply turn via:
+//   1. Module A's local JSONL transcript (lib/transcript-store.ts).
+//      Populated by Module A on every `message_received`. Reads are <10ms
+//      (single fs.readFileSync + JSON.parse per line). Used when the store
+//      has at least `max(3, lastN/2)` rows for the chat.
 //
-//   lark-cli im chats.messages list --chat-id <chat_id> --page-size <N+5>
+//   2. Live Feishu open-api list endpoint (fallback for cold chats).
+//      The raw call we use is:
 //
-// We over-fetch slightly because we filter out:
+//        lark-cli api GET /open-apis/im/v1/messages \
+//          --params '{"container_id_type":"chat","container_id":"<oc_…>",
+//                     "page_size":<N+5>,"sort_type":"ByCreateTimeDesc"}' \
+//          --as bot
+//
+//      We deliberately bypass the `+chat-messages-list` shortcut, which
+//      adds `only_thread_root_messages=true` and silently filters out every
+//      threaded reply (the dominant shape in active group chats).
+//
+//      Cost: ~1.5–2s (lark-cli spawn + HTTPS round-trip + JSON parse), so
+//      we only use it when the transcript is too sparse to satisfy `lastN`.
+//
+// We over-fetch slightly in both paths because we filter out:
 //   - the current trigger message (matched by message_id)
 //   - bot's own past replies (matched by bot open_id)
 //   - non-text events (system join/leave, recall markers, etc.)
@@ -44,9 +58,7 @@
 // the sentinel, Module C never runs. If Module B returns undefined (reply
 // allowed), Module C runs next.
 //
-// To stay robust if registration order ever flips, Module C also re-checks
-// the run-context gate state and bails out if it sees `outcome: 'skip'`.
-//
+
 // Note (2026-05): Both modules switched from `inbound_claim` (which doesn't
 // fire for non-bundled plugins on our path) to `message_received` (which
 // unconditionally fires pre-mention-gate). The message_received event is
@@ -54,6 +66,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { LarkShellError, runLarkCliJson } from '../lib/lark-shell.js';
+import { getTranscriptStore, type TranscriptRecord } from '../lib/transcript-store.js';
 import { getBotOpenId } from './reply-gate.js';
 
 // `message_received` event/ctx types are declared in the SDK but NOT
@@ -350,8 +363,79 @@ export function formatContextBlock(opts: {
 }
 
 /**
+ * Convert a TranscriptRecord (Module A's JSONL row) into the loose
+ * FeishuMessage shape used by formatContextBlock. We don't have full Feishu
+ * envelope fields here — we only need `message_id`, `create_time`,
+ * `body.content`, and `sender.sender_id.open_id`.
+ */
+function transcriptRecordToFeishuMessage(r: TranscriptRecord): FeishuMessage {
+  // formatContextBlock decodes body.content based on msg_type; text records
+  // are JSON-encoded `{"text":"..."}` in real Feishu payloads, but Module A
+  // stores the raw `event.content` (already a JSON string for posts, plain
+  // for text). The simplest, lossless choice: wrap as a `text` msg with the
+  // already-decoded `content` re-encoded as `{"text": "..."}` so the
+  // existing decoder path works uniformly.
+  return {
+    message_id: r.messageId,
+    msg_type: r.msgType === 'post' ? 'text' : (r.msgType || 'text'),
+    create_time: String(r.ts),
+    body: { content: JSON.stringify({ text: r.content }) },
+    sender: {
+      sender_id: { open_id: r.senderOpenId },
+    },
+  };
+}
+
+/**
+ * Read the last-N transcript block from Module A's local store. Returns
+ * `null` when the store has fewer than `minRows` qualifying records (caller
+ * falls back to the live API).
+ *
+ * Ordering note: the JSONL file is append-only with two writers — direct
+ * event-capture (Module A) and API backfill (transcript-backfill.ts). They
+ * write at different times, so the file's line order is NOT strictly
+ * chronological. We sort by `ts` desc here to recover the true ordering
+ * before handing off to `formatContextBlock`, which labels its output
+ * "latest first".
+ *
+ * To cap the cost of the sort we over-read by OVERFETCH_PAD records and
+ * trim post-sort to `lastN`, so we never pay more than O((lastN+pad) log)
+ * on the tail.
+ */
+export function readContextBlockFromTranscript(opts: {
+  chatId: string;
+  lastN: number;
+  triggerMessageId?: string;
+  botOpenId: string | null;
+  /** Minimum useful row count before we trust the local store. */
+  minRows: number;
+}): FormattedContext | null {
+  // Over-fetch a little: we filter out the trigger message and own-bot
+  // messages, so the raw tail must be larger than `lastN`.
+  const records = getTranscriptStore().readTail(opts.chatId, opts.lastN + OVERFETCH_PAD);
+  if (records.length < opts.minRows) return null;
+  // Sort newest-first. Stable enough for our needs — ts collisions are rare
+  // and inconsequential.
+  records.sort((a, b) => b.ts - a.ts);
+  const messages = records.map(transcriptRecordToFeishuMessage);
+  return formatContextBlock({
+    messages,
+    botOpenId: opts.botOpenId,
+    triggerMessageId: opts.triggerMessageId,
+    lastN: opts.lastN,
+  });
+}
+
+/**
  * Fetch and format the last-N transcript block for a chat. Returns null on
  * any failure (caller logs + degrades gracefully).
+ *
+ * Implementation note: we call the raw open-api endpoint
+ * (`/open-apis/im/v1/messages`) via `lark-cli api GET --params <json>` instead
+ * of the `+chat-messages-list` shortcut. The shortcut implicitly sends
+ * `only_thread_root_messages=true`, which silently filters out all threaded
+ * replies — the dominant message shape in active group chats. Calling the
+ * endpoint directly lets us omit that param and get the full transcript.
  */
 export async function fetchContextBlock(opts: {
   chatId: string;
@@ -359,17 +443,23 @@ export async function fetchContextBlock(opts: {
   triggerMessageId?: string;
   botOpenId: string | null;
 }): Promise<FormattedContext | { error: string }> {
-  const pageSize = String(opts.lastN + OVERFETCH_PAD);
+  const pageSize = opts.lastN + OVERFETCH_PAD;
+  const params = JSON.stringify({
+    container_id_type: 'chat',
+    container_id: opts.chatId,
+    page_size: pageSize,
+    sort_type: 'ByCreateTimeDesc',
+  });
   try {
     const envelope = await runLarkCliJson<LarkListMessagesEnvelope>(
       [
-        'im',
-        'chats.messages',
-        'list',
-        '--chat-id',
-        opts.chatId,
-        '--page-size',
-        pageSize,
+        'api',
+        'GET',
+        '/open-apis/im/v1/messages',
+        '--params',
+        params,
+        '--as',
+        'bot',
       ],
       { timeoutMs: 12_000 },
     );
@@ -480,6 +570,36 @@ export function register(api: CtxApi): void {
     }
 
     const botOpenId = await getBotOpenId();
+
+    // ── Fast path: Module A's local JSONL transcript ──
+    // Module A captures every `message_received` event into a per-chat JSONL
+    // file. When the local store has enough rows to satisfy `lastN`, we use
+    // it — a few-millisecond file read vs the ~1.5–2s lark-cli round-trip.
+    //
+    // `minRows` heuristic: half the requested lastN, with a floor of 3. If the
+    // local store has fewer rows than that, the chat probably hasn't been
+    // around long enough for Module A to be useful yet — fall back to the
+    // live API which sees server-side history that pre-dates plugin install.
+    const localMin = Math.max(3, Math.floor(cfg.lastN / 2));
+    const local = readContextBlockFromTranscript({
+      chatId: state.chatId,
+      lastN: cfg.lastN,
+      triggerMessageId: state.triggerMessageId,
+      botOpenId,
+      minRows: localMin,
+    });
+    if (local && local.msgCount > 0 && local.block) {
+      log(
+        api,
+        'info',
+        `context-injected msgs=${local.msgCount} chat=${state.chatId} src=transcript`,
+      );
+      return {
+        appendSystemContext: local.block,
+      };
+    }
+
+    // ── Fallback: live Feishu API ──
     const result = await fetchContextBlock({
       chatId: state.chatId,
       lastN: cfg.lastN,
@@ -495,7 +615,7 @@ export function register(api: CtxApi): void {
     log(
       api,
       'info',
-      `context-injected msgs=${result.msgCount} chat=${state.chatId}`,
+      `context-injected msgs=${result.msgCount} chat=${state.chatId} src=lark-api`,
     );
     if (result.msgCount === 0 || !result.block) {
       return undefined;

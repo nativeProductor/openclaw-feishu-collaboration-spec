@@ -60,6 +60,15 @@ export function runLarkCli(args: string[], opts: LarkShellRunOptions = {}): Prom
   const binary = opts.binary ?? 'lark-cli';
   const timeoutMs = opts.timeoutMs ?? 15000;
 
+  // If LARK_PROFILE is set in the environment, inject `--profile <name>` at
+  // the front of every lark-cli invocation. Needed for multi-bot setups
+  // where multiple OpenClaw gateways share the same `~/.lark-cli/openclaw/
+  // config.json` — without this, all daemons end up using the file's
+  // `currentApp` which is single-valued.
+  const profileEnv = process.env.LARK_PROFILE;
+  const effectiveArgs =
+    profileEnv && !args.includes('--profile') ? ['--profile', profileEnv, ...args] : args;
+
   return new Promise((resolve, reject) => {
     let stdout = '';
     let stderr = '';
@@ -67,7 +76,7 @@ export function runLarkCli(args: string[], opts: LarkShellRunOptions = {}): Prom
 
     let child;
     try {
-      child = spawn(binary, args, {
+      child = spawn(binary, effectiveArgs, {
         cwd: opts.cwd,
         env: opts.env ? { ...process.env, ...opts.env } : process.env,
         stdio: ['ignore', 'pipe', 'pipe'],

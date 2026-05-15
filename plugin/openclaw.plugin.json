@@ -29,8 +29,9 @@
         "properties": {
           "mode": {
             "type": "string",
-            "enum": ["mention-only", "autonomous"],
-            "default": "mention-only"
+            "enum": ["mention-only"],
+            "default": "mention-only",
+            "description": "Reply gate behavior. Only mode supported: mention-only — in groups, the bot replies only when @-mentioned. P2P chats always reply."
           }
         }
       },
@@ -38,10 +39,18 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean", "default": true },
-          "lastN": { "type": "number", "default": 20, "minimum": 1, "maximum": 200 },
-          "ttlHours": { "type": "number", "default": 168, "minimum": 1 },
-          "maxRowsPerChat": { "type": "number", "default": 2000, "minimum": 100 }
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Inject recent group conversation into the system prompt before each reply."
+          },
+          "lastN": {
+            "type": "number",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 200,
+            "description": "How many recent messages to include in the injected context block."
+          }
         }
       },
       "crossBot": {

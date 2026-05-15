@@ -1,61 +1,69 @@
-# OpenClaw Feishu Collaboration
+# OpenClaw 飞书插件
 
-> 让 OpenClaw bot 在飞书群被 @ 时,自动带上最近的群聊上下文。
+让 OpenClaw bot 在飞书群里被 @ 时能拿到完整的群聊上下文。不被 @ 时静默旁听，但消息记录会进本地存储；下次被 @ 时模型能引用前面的讨论。
 
-## 它解决什么
+## 装了之后的效果
 
-| 场景 | 没装插件 | 装上后 |
-|---|---|---|
-| 群里聊了 10 分钟某事,有人 @ bot:"这事你怎么看" | "您问的是哪件事?"(看不到前情) | 基于刚才的讨论直接回答 |
-| bot A @ bot B 提问 | bot B 答完不 @ 回去 → 对话断在第一棒 | bot B 自动 @ 回 A 接力,5 轮后自然消退避免死循环 |
+**场景 1**：群里讨论了 10 分钟某个 PR 怎么改，有人 @ bot 问"方案 A 还是 B 好"。
 
-## 它怎么工作
+装之前：bot 回"您说的方案 A 和 B 是？"——它只能看到最新这条消息。
+装之后：bot 基于前面的讨论给意见，会引用具体发言。
+
+**场景 2**：两个 bot 同时被拉进群，A @ B 提问。
+
+装之前：B 答完不会 @ 回 A，对话断在第一棒。
+装之后：B 自动 @ 回 A 接力。但**不会**无限循环——到第 3 轮系统提示 B 收尾，第 5 轮起 B 的回复不带 @，对方接收不到 @ 事件，对话自然散场。
+
+## 工作原理
 
 ```
-                            ┌─────────────────┐
-群里有人发消息  ──────────►  │ plugin 默默旁听 │  落进本地 SQLite (per chat)
-                            └─────────────────┘
-                                     │
-被 @ bot 那一刻  ──────────► 拼上最近 20 条 ──► bot 模型 ──► 回复消息
-                                                              │
-                              ┌───────────────────────────────┤
-                              ▼                               ▼
-                         发起方是人                       发起方是另一个 bot
-                         回复 @ 这个人                    回复 @ 这个 bot
-                                                              │
-                                                         到第 5 轮就不 @ 了
-                                                         (让对话自然散场)
+              ┌──────────────────────────────────────────┐
+群里有人发消息  │ Module A: 旁听 → 本地 JSONL              │
+              │ 同时用 API 把 WebSocket 漏掉的             │
+              │ 其他 bot 的非 @ 消息补回来                 │
+              └──────────────────────────────────────────┘
+                              ↓
+              ┌──────────────────────────────────────────┐
+被 @          │ Module B: 鉴权                            │
+              │ 群里只回 @ 自己的；私聊全回                │
+              └──────────────────────────────────────────┘
+                              ↓
+              ┌──────────────────────────────────────────┐
+              │ Module C: 拼上下文                        │
+              │ 本地有缓存 → 几毫秒                       │
+              │ 冷启动 → 现拉 API 1~2 秒                  │
+              └──────────────────────────────────────────┘
+                              ↓
+                         模型生成回复
+                              ↓
+              ┌──────────────────────────────────────────┐
+              │ Module D: 自动 @ 回 + 刹车                │
+              │ 人 @ bot   → 回复带 @                    │
+              │ bot @ bot → 带 @，深度递增               │
+              │   < maxDepth 轮: 正常回复带 @             │
+              │   ≥ maxDepth 轮: 回复不带 @，链路自然断   │
+              │ 人插一句话 → 深度归零                    │
+              └──────────────────────────────────────────┘
 ```
 
-**零拓扑** — bot 装上即用,任何群都生效,不需要写任何 chat_id / bot_id。
+注：上下文窗口默认取最近 20 条（可配置），本地实际保留最近 2000 条记录——存的多是为了应对群内聊得快的情况，每次取 20 是因为更多通常没用且占 token。
 
-## 部署
+## 安装
 
-前置:OpenClaw `>=2026.5.6` + `@openclaw/feishu` 渠道。飞书后台权限 `im:message` + `im:message.group_at_msg`(必须),`im:chat.members:read` + `im:resource`(可选,加速对端 bot 发现 + 支持图片输入)。
+三步，缺一不可。
 
 ```bash
-# 1. 安装
+# 1. 装包
 openclaw plugins install openclaw-feishu-collaboration-spec
 
-# 2. 启用
-openclaw config patch --stdin <<'EOF'
-{
-  "plugins": {
-    "entries": {
-      "feishu-collab": {
-        "enabled": true,
-        "hooks": { "allowConversationAccess": true }
-      }
-    }
-  }
-}
-EOF
+# 2. 授权钩子访问
+node scripts/ensure-hooks.mjs
 
 # 3. 重启 gateway
 openclaw gateway restart
 ```
 
-装完不用调任何配置,默认就是该有的样子。
+第二步必须跑：`plugins install` 会重置钩子配置，这个脚本用来恢复。每次 reinstall 都要重跑一遍。
 
 ## 相关 X/Twitter 工作流
 
@@ -67,21 +75,92 @@ openclaw plugins install @xquik/tweetclaw
 
 [TweetClaw](https://github.com/Xquik-dev/tweetclaw) 覆盖 scrape tweets,tweet scraper workflows,search tweets,search tweet replies,follower export,user lookup,media upload,media download,direct messages,monitor tweets,webhooks,giveaway draws,以及需要审批的 post tweets 和 post tweet replies。这个插件负责把飞书讨论和后续决策留在群上下文里,TweetClaw 负责 X/Twitter 数据读取和可见动作。安装细节请看 TweetClaw GitHub 仓库和 [npm package](https://www.npmjs.com/package/@xquik/tweetclaw); [ClawHub discovery page](https://clawhub.ai/plugins/@xquik/tweetclaw) 在 listing 落后 npm 时仍适合浏览发现。请分开保存飞书/Lark 与 X/Twitter 凭据,并通过 OpenClaw approval flows 审批可见的 X/Twitter 动作。
 
-## 改默认行为(可选)
+启动日志里能看到这一行表示成功：
+
+```
+[feishu-collab] bot identity resolved open_id=ou_... app_id=cli_...
+```
+
+### 飞书权限
+
+| 权限 | 用途 |
+|---|---|
+| `im:message` | 通过 API 拉群消息历史 |
+| `im:message.group_at_msg` | 接收"@ 自己"的事件 |
+| `im:message.group_msg` | 接收群里非 @ 的用户消息事件（让 Module A 实时入库，不依赖 backfill） |
+| `im:chat.members:read` | 区分群成员是人还是 bot（刹车需要） |
+
+后台开权限后记得发版。
+
+## 排查问题
+
+按这个顺序查：
+
+1. `~/.openclaw-<profile>/logs/gateway.log` 里搜 `feishu-collab`，看插件是否加载成功
+2. 看启动日志里有没有 `bot identity resolved`，没有说明 `lark-cli auth` 没登录或权限未开
+3. 看消息处理日志里有没有 `gate-decision: reply`——这是 bot 决定要回复的标志。消息来了但没这行说明 Module B 把它过滤掉了
+4. 本地 transcript 在 `~/.openclaw-<profile>/state/feishu-collab/transcripts/<chat_id>.jsonl`
+5. 这个文件被删不会让插件崩，只会丢上下文（下次有事件触发 backfill 会重新拉一遍）
+
+## 已知限制
+
+装之前需要了解：
+
+- **单机本地存储**。JSONL 文件不跨实例共享。多机部署同一个 bot 时，每台机器维护各自的 transcript。这是有意的设计——加分布式存储会带来不成比例的协调复杂度。
+- **没有 API rate limit 重试**。飞书 API 撞墙时该轮 backfill 会丢失，下次事件触发会自动重试。稳态下未遇到过限流，但激进部署需要监控。
+- **不能完全停止回复**。OpenClaw SDK 不支持插件层 short-circuit 整个回复流程。刹车最强档是"回复不带 @"——对方接收不到 @ 事件，对话链路自然中断。
+- **冷启动首次回复较慢**。新装的 bot 在新群里第一次被 @ 时，本地无缓存，需要现调 API 拉历史，约 1~2 秒。第二次起本地命中，<10 ms。
+
+## 修改默认配置
+
+绝大多数场景无需修改。如需调整：
 
 ```bash
-# 只被动旁听,不主动反 @ 别的 bot
+# 关闭 bot↔bot 的自动 @ 回（只对人 @ 回）
 openclaw config patch --stdin <<'EOF'
-{"plugins":{"entries":{"feishu-collab":{"config":{"crossBot":{"atBack":false}}}}}}
+{"plugins":{"entries":{"feishu-collab":{"config":{"crossBot":{"atBackBots":false}}}}}}
 EOF
 
-# 把群历史窗口扩到 50 条
+# 把上下文窗口拉到 50 条
 openclaw config patch --stdin <<'EOF'
 {"plugins":{"entries":{"feishu-collab":{"config":{"context":{"lastN":50}}}}}}
 EOF
+
+# 调整刹车阈值（默认 5）
+openclaw config patch --stdin <<'EOF'
+{"plugins":{"entries":{"feishu-collab":{"config":{"crossBot":{"loopGuard":{"maxDepth":8}}}}}}}
+EOF
 ```
 
-## 链接
+## 常见问题
 
-- GitHub: <https://github.com/nativeProductor/openclaw-feishu-collaboration-spec>
-- License: MIT
+**Q：怎么不让 bot 自己主动发言？**
+
+不会发。`gate.mode` 只支持 `mention-only`——只回复 @ 自己的消息。早期考虑过让 bot 主动插嘴，试下来体验很差，所以从代码层面去掉了。
+
+**Q：bot↔bot 为什么有刹车，人 @ bot 没刹车？**
+
+人 @ bot 不会循环——人下一句就走开了。bot @ bot 不加约束会变成机器对机器无限对刷。刹车很简单：前 `maxDepth - 1` 轮正常带 @ 回；到了第 `maxDepth` 轮起，回复**不带 @**，对方收不到 @ 事件，链路自然断。`maxDepth=5` 默认值来自飞书官方对 agent 多轮对话的建议。
+
+早期设计在 D=3、D=4 还塞过"该收尾了"的系统提示词，但实测下来模型把"收尾"理解得太极端，直接返回空内容——结果 Module D 还是在空内容前加了 @，发出去一条"@对方"光秃秃没正文的消息。后来把中间档的提示词全去掉了，模型自己聊到第 5 轮自然会发现 @ 没生效（peer 不回了），结束得也挺自然。
+
+**Q：私聊里能用吗？**
+
+私聊不受这个插件影响。私聊里不存在 bot @ bot 的循环，也没有"@ vs 不 @"的区分，bot 对所有消息都正常回复。
+
+**Q：历史消息里包含哪些内容？人和 bot 的非 @ 消息都有吗？**
+
+包含。两条管道合起来：
+
+1. WebSocket 事件推送你能收到的所有消息——包括人没 @ 的发言和其他 bot @ 你的发言
+2. 每次事件触发时，插件会用 API 把 WebSocket 漏掉的内容（其他 bot 没 @ 任何人时说的话）补回本地
+
+**Q：消息会存到爆吗？**
+
+不会。每个群一个 JSONL 文件，默认上限 2000 条；超出后保留最近 1333 条，旧消息丢弃。纯按条数算，没有按天数过期——群冷了不代表上下文要忘掉，下次激活时历史还在。
+
+容量估算：单条记录约 500 字节，单群最大约 1MB，100 个活跃群占用几十 MB。
+
+## 源码
+
+[GitHub](https://github.com/nativeProductor/openclaw-feishu-collaboration-spec) · MIT License

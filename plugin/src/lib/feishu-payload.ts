@@ -96,56 +96,176 @@ function findFeishuEnvelope(input: unknown): Record<string, unknown> | undefined
 }
 
 /**
- * Parse an inbound event payload into a normalized {@link InboundSummary}.
- * Always returns a fully-shaped object; missing fields are empty strings
- * (or `false` for booleans). Never throws on malformed input.
+ * Strip OpenClaw routing prefixes from a conversationId to recover the
+ * underlying Feishu chat_id. Examples:
+ *   "chat:oc_38e..."        → "oc_38e..."
+ *   "feishu:chat:oc_38e..." → "oc_38e..."
+ *   "oc_38e..."             → "oc_38e..."
  */
-export function parseInboundSummary(rawEvent: unknown): InboundSummary {
-  const envelope = findFeishuEnvelope(rawEvent);
-  const sender = asObj(envelope?.sender);
-  const senderId = asObj(sender?.sender_id);
-  const message = asObj(envelope?.message);
+function stripChannelPrefix(value: string): string {
+  let out = value;
+  // strip up to two layers of "<prefix>:" if they don't match the Feishu id shape
+  for (let i = 0; i < 2; i++) {
+    if (out.startsWith('oc_') || out.startsWith('ou_') || out.startsWith('on_')) break;
+    const idx = out.indexOf(':');
+    if (idx < 0) break;
+    out = out.slice(idx + 1);
+  }
+  return out;
+}
 
-  const senderOpenId = asStr(senderId?.open_id);
-  const senderType = asStr(sender?.sender_type) as FeishuSenderType;
+/**
+ * Parse the FLAT `message_received` shape:
+ *   event = { from, content, senderId, messageId, sessionKey, runId, metadata, ... }
+ *   ctx   = { channelId, accountId, conversationId, sessionKey, messageId, senderId, ... }
+ *
+ * Returns a partial InboundSummary; merged with envelope-based parsing by the
+ * caller. The two shapes are NOT mutually exclusive — some hosts populate
+ * both, in which case envelope wins (richer info).
+ */
+function parseFlatMessageReceived(
+  event: Record<string, unknown> | undefined,
+  ctx: Record<string, unknown> | undefined,
+): Partial<InboundSummary> {
+  if (!event && !ctx) return {};
 
-  // peer app_id: when a bot is the sender, Feishu surfaces `sender_id.app_id`.
-  // We treat any non-empty app_id under sender_id as the peer identity.
-  const peerAppId = asStr(senderId?.app_id);
+  // sender open_id: event.from / event.senderId / ctx.senderId
+  // OpenClaw namespaces ids like "feishu:ou_xxx"; strip the routing prefix.
+  const senderOpenIdRaw =
+    asStr(event?.from) || asStr(event?.senderId) || asStr(ctx?.senderId);
+  const senderOpenId = senderOpenIdRaw ? stripChannelPrefix(senderOpenIdRaw) : '';
 
-  const chatId = asStr(message?.chat_id);
-  const chatType = asStr(message?.chat_type);
-  const messageId = asStr(message?.message_id);
+  // chat_id: ctx.conversationId, possibly prefixed
+  const conversationId = asStr(ctx?.conversationId);
+  const chatId = conversationId ? stripChannelPrefix(conversationId) : '';
 
-  const mentionsRaw = message?.mentions;
-  const mentions: unknown[] = Array.isArray(mentionsRaw) ? mentionsRaw : [];
+  // chat_type: heuristic — Feishu group chat ids start with 'oc_'
+  let chatType = '';
+  if (chatId.startsWith('oc_')) chatType = 'group';
+  else if (chatId.startsWith('ou_') || chatId.startsWith('on_')) chatType = 'p2p';
+
+  // sender_type: best-effort from event.metadata.senderType / sender_type
+  const meta = asObj(event?.metadata);
+  let senderType = asStr(meta?.sender_type) || asStr(meta?.senderType);
+  // Fallback: try sender_id.app_id presence in metadata
+  const metaSenderId = asObj(meta?.sender_id);
+  const metaAppId = asStr(metaSenderId?.app_id) || asStr(meta?.app_id);
+
+  // peer_app_id: only set if metadata explicitly reveals an app_id
+  const peerAppId = metaAppId;
+
+  // If we have a peer app_id, sender is a bot.
+  if (peerAppId && !senderType) senderType = 'app';
+
+  // mentions: scan event.content for <at user_id="ou_..."> tags
+  // (Feishu rich text includes <at> tags in `content`.)
+  const content = asStr(event?.content);
   let isMentionedByBot = false;
-  for (const m of mentions) {
-    const mo = asObj(m);
-    if (!mo) continue;
-    // A mention is "by a bot" when its `id` block carries an app_id, or when
-    // its `tenant_key` is the same as a bot tenant_key. The cheap reliable
-    // signal Feishu gives us is the presence of `app_id` on the mention id.
-    const mid = asObj(mo.id);
-    if (mid && asStr(mid.app_id)) {
-      isMentionedByBot = true;
-      break;
-    }
-    // Some host normalizers flatten id into the mention itself.
-    if (asStr(mo.app_id)) {
-      isMentionedByBot = true;
-      break;
+  if (content) {
+    // We can't reliably tell from raw `<at user_id="ou_xxx">` alone whether
+    // the mention target is a bot — that requires a member-list lookup.
+    // Leave isMentionedByBot=false; Module B/D's caller logic that needs this
+    // signal can supplement via member-cache or by checking metadata.mentions.
+    // Mentions list in metadata, if host provides it:
+    const metaMentions = meta?.mentions;
+    if (Array.isArray(metaMentions)) {
+      for (const m of metaMentions) {
+        const mo = asObj(m);
+        if (!mo) continue;
+        const mid = asObj(mo.id);
+        if (mid && asStr(mid.app_id)) {
+          isMentionedByBot = true;
+          break;
+        }
+        if (asStr(mo.app_id)) {
+          isMentionedByBot = true;
+          break;
+        }
+      }
     }
   }
 
+  const messageId = asStr(event?.messageId) || asStr(ctx?.messageId);
+
   return {
     senderOpenId,
-    senderType,
+    senderType: (senderType || '') as FeishuSenderType,
     isMentionedByBot,
     peerAppId,
     chatId,
     chatType,
     messageId,
+  };
+}
+
+/**
+ * Parse an inbound event payload into a normalized {@link InboundSummary}.
+ *
+ * Handles BOTH event shapes:
+ *   - Nested envelope (inbound_claim / raw IM event): `event.message.sender.…`
+ *   - Flat message_received: `event.from / event.content / ctx.conversationId`
+ *
+ * Always returns a fully-shaped object; missing fields are empty strings
+ * (or `false` for booleans). Never throws on malformed input.
+ *
+ * Pass `ctx` whenever you're called from a hook that gets it — the flat
+ * message_received shape requires ctx.conversationId for chat_id.
+ */
+export function parseInboundSummary(rawEvent: unknown, ctx?: unknown): InboundSummary {
+  const envelope = findFeishuEnvelope(rawEvent);
+  const sender = asObj(envelope?.sender);
+  const senderId = asObj(sender?.sender_id);
+  const message = asObj(envelope?.message);
+
+  const envelopeSenderOpenId = asStr(senderId?.open_id);
+  const envelopeSenderType = asStr(sender?.sender_type) as FeishuSenderType;
+  const envelopePeerAppId = asStr(senderId?.app_id);
+  const envelopeChatId = asStr(message?.chat_id);
+  const envelopeChatType = asStr(message?.chat_type);
+  const envelopeMessageId = asStr(message?.message_id);
+
+  const mentionsRaw = message?.mentions;
+  const mentions: unknown[] = Array.isArray(mentionsRaw) ? mentionsRaw : [];
+  let envelopeIsMentionedByBot = false;
+  for (const m of mentions) {
+    const mo = asObj(m);
+    if (!mo) continue;
+    const mid = asObj(mo.id);
+    if (mid && asStr(mid.app_id)) {
+      envelopeIsMentionedByBot = true;
+      break;
+    }
+    if (asStr(mo.app_id)) {
+      envelopeIsMentionedByBot = true;
+      break;
+    }
+  }
+
+  // If envelope-based parsing gave us anything substantive, use it.
+  const envelopeUseful = !!(envelopeSenderOpenId || envelopeChatId);
+
+  if (envelopeUseful) {
+    return {
+      senderOpenId: envelopeSenderOpenId,
+      senderType: envelopeSenderType,
+      isMentionedByBot: envelopeIsMentionedByBot,
+      peerAppId: envelopePeerAppId,
+      chatId: envelopeChatId,
+      chatType: envelopeChatType,
+      messageId: envelopeMessageId,
+    };
+  }
+
+  // Fall back to flat message_received shape (event + ctx).
+  const flat = parseFlatMessageReceived(asObj(rawEvent), asObj(ctx));
+  return {
+    senderOpenId: flat.senderOpenId ?? '',
+    senderType: (flat.senderType ?? '') as FeishuSenderType,
+    isMentionedByBot: flat.isMentionedByBot ?? false,
+    peerAppId: flat.peerAppId ?? '',
+    chatId: flat.chatId ?? '',
+    chatType: flat.chatType ?? '',
+    messageId: flat.messageId ?? '',
   };
 }
 
