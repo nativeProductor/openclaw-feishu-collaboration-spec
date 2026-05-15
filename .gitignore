@@ -49,6 +49,9 @@ harness/
 
 # Dev bootstrap scripts (spin up a local dev bot, sync local doc to Feishu)
 scripts/
+# …but ensure-hooks.mjs is a user-facing runtime helper (referenced by
+# README install instructions), not a dev artifact — keep it tracked.
+!scripts/ensure-hooks.mjs
 
 # Project root env scaffolding (only needed by the local dev scripts above)
 .env.example
