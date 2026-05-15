@@ -1,6 +1,7 @@
 // `openclaw` is a peer dependency provided by the host at runtime.
 import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
 
+import { register as registerTranscriptCapture } from './modules/transcript-capture.js';
 import { register as registerReplyGate } from './modules/reply-gate.js';
 import { register as registerContextInject } from './modules/context-inject.js';
 import { register as registerCrossBot } from './modules/cross-bot.js';
@@ -13,17 +14,20 @@ const PLUGIN_ID = 'feishu-collab';
 const LOG_PREFIX = `[${PLUGIN_ID}]`;
 
 /**
- * Plugin entry — orchestrates Modules B, C, D.
+ * Plugin entry — orchestrates Modules A, B, C, D.
  *
+ *   Module A (Transcript):     message_received  — passive capture to JSONL
  *   Module B (Reply Gate):     message_received + before_prompt_build
  *   Module C (Context Inject): message_received + before_prompt_build
  *   Module D (Cross-bot @):    before_prompt_build + llm_output + agent_end
  *
- * Registration order matters: B is registered before C so that on
- * before_prompt_build B's skip-sentinel short-circuits C's lark-cli fetch.
- * Module A (transcript capture) is still a stub; we use message_received as
- * the unconditional pre-mention-gate hook (inbound_claim doesn't fire for
- * non-bundled plugins on our path).
+ * Registration order matters:
+ *   - A is first so the transcript captures everything before B/C/D run.
+ *   - B is before C so on before_prompt_build B's skip-sentinel short-circuits
+ *     C's transcript read / API fallback.
+ *
+ * Hooks used: `message_received` is the unconditional pre-mention-gate hook
+ * (inbound_claim doesn't fire for non-bundled plugins on our path).
  */
 const pluginEntry = definePluginEntry({
   id: PLUGIN_ID,
@@ -33,6 +37,7 @@ const pluginEntry = definePluginEntry({
   register(api: any) {
     // eslint-disable-next-line no-console
     console.log(`${LOG_PREFIX} skel:register fired`);
+    registerTranscriptCapture(api);
     registerReplyGate(api);
     registerContextInject(api);
     registerCrossBot(api);
