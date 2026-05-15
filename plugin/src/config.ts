@@ -19,8 +19,6 @@ export const FeishuCollabConfig = Type.Object({
     Type.Object({
       enabled: Type.Optional(Type.Boolean()),
       lastN: Type.Optional(Type.Number()),
-      ttlHours: Type.Optional(Type.Number()),
-      maxRowsPerChat: Type.Optional(Type.Number()),
     }),
   ),
 

@@ -28,6 +28,7 @@
 import { parseInboundSummary } from '../lib/feishu-payload.js';
 import { backfillChatTranscript } from '../lib/transcript-backfill.js';
 import { getTranscriptStore } from '../lib/transcript-store.js';
+import { getOwnAppId } from './reply-gate.js';
 
 const LOG_PREFIX = '[feishu-collab]';
 
@@ -90,32 +91,11 @@ function readMsgType(event: PluginHookMessageReceivedEvent): string {
   return 'text';
 }
 
-/**
- * Best-effort: pull the host's own bot app_id from the ctx the hook
- * receives. The backfill uses it to skip our own outbound replies. Defined
- * inline (rather than imported from cross-bot) to keep Module A
- * dependency-free relative to Module D. Mirrors `readOwnAppId` in
- * cross-bot.ts.
- */
-function readOwnAppId(ctx: unknown): string {
-  if (!ctx || typeof ctx !== 'object') return '';
-  const c = ctx as Record<string, unknown>;
-  const direct = c.botAppId ?? c.ownAppId ?? c.appId;
-  if (typeof direct === 'string') return direct;
-  const account = c.account;
-  if (account && typeof account === 'object') {
-    const a = account as Record<string, unknown>;
-    if (typeof a.appId === 'string') return a.appId;
-    if (typeof a.app_id === 'string') return a.app_id;
-  }
-  const channel = c.channel;
-  if (channel && typeof channel === 'object') {
-    const ch = channel as Record<string, unknown>;
-    if (typeof ch.appId === 'string') return ch.appId;
-    if (typeof ch.app_id === 'string') return ch.app_id;
-  }
-  return process.env.FEISHU_APP_ID || process.env.LARK_APP_ID || '';
-}
+// Note on identity: we used to read app_id from `ctx` per hook fire, but
+// the OpenClaw `message_received` context doesn't reliably carry that
+// field — `ctx.botAppId` / `ctx.account.appId` were empty in practice.
+// We now use the module-scope cached `getOwnAppId()` which reads from
+// process.env or `~/.openclaw-<profile>/openclaw.json` once per process.
 
 export function register(api: CtxApi): void {
   const store = getTranscriptStore();
@@ -158,7 +138,12 @@ export function register(api: CtxApi): void {
       // dedups against the local store and merges in any messages we
       // missed. Off the reply hot path; per-chat throttled to one call
       // per ~3s. Never blocks event handling, never throws.
-      const ownAppId = readOwnAppId(ctx);
+      //
+      // ownAppId from getOwnAppId() (module-scope cached) is used to
+      // filter out our own outbound replies; without this they leak into
+      // the transcript and Module C would inject them into the system
+      // prompt as if they were peer turns.
+      const ownAppId = getOwnAppId();
       void backfillChatTranscript(summary.chatId, store, { ownAppId }).catch(() => {
         // backfillChatTranscript itself never throws; this catch is
         // belt-and-suspenders against any future signature drift.

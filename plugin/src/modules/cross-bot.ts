@@ -225,10 +225,9 @@ function peekPendingInbound(sessionKey: string | undefined): InboundSummary | un
   return inboundBySession.get(sessionKey)?.summary;
 }
 
-function evictPendingInbound(sessionKey: string | undefined): void {
-  if (!sessionKey) return;
-  inboundBySession.delete(sessionKey);
-}
+// No evict path: agent_end races with llm_output (the inbound summary needs
+// to outlive the brake bookkeeping); we let `inboundBySession` self-bound
+// via INBOUND_CACHE_MAX's LRU-on-overflow trim.
 
 /** Extract sessionKey from event or ctx (host populates one of them). */
 function readSessionKey(event: unknown, ctx: unknown): string | undefined {

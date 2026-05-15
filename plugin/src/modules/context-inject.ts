@@ -58,9 +58,7 @@
 // the sentinel, Module C never runs. If Module B returns undefined (reply
 // allowed), Module C runs next.
 //
-// To stay robust if registration order ever flips, Module C also re-checks
-// the run-context gate state and bails out if it sees `outcome: 'skip'`.
-//
+
 // Note (2026-05): Both modules switched from `inbound_claim` (which doesn't
 // fire for non-bundled plugins on our path) to `message_received` (which
 // unconditionally fires pre-mention-gate). The message_received event is

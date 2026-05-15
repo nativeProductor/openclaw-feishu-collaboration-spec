@@ -68,6 +68,10 @@
 // module stays the same.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
 import { runLarkCliJson } from '../lib/lark-shell.js';
 
 // `message_received` event/ctx types live in the SDK but are NOT re-exported
@@ -278,6 +282,55 @@ function extractBotOpenId(raw: unknown): string | null {
   return null;
 }
 
+let cachedOwnAppId: string | null = null;
+
+/**
+ * Resolve the running bot's Feishu app_id (`cli_xxx`). Used by Module A's
+ * transcript backfill to filter out our own outbound replies from the API
+ * results (the messages we sent ourselves shouldn't pollute the transcript).
+ *
+ * Resolution order:
+ *   1. process.env.FEISHU_APP_ID / LARK_APP_ID (test/override hook)
+ *   2. `~/.openclaw-<profile>/openclaw.json` → channels.feishu.appId
+ *   3. '' (caller treats as "unknown" — no own-bot filtering)
+ *
+ * Cached module-scope; reads the config file at most once per process.
+ * Synchronous because Node's plugin loader runs in the same process as the
+ * gateway, so the file is always on local disk and tiny.
+ */
+export function getOwnAppId(): string {
+  if (cachedOwnAppId !== null) return cachedOwnAppId;
+  const fromEnv = process.env.FEISHU_APP_ID || process.env.LARK_APP_ID;
+  if (fromEnv) {
+    cachedOwnAppId = fromEnv;
+    return cachedOwnAppId;
+  }
+  try {
+    const home =
+      process.env.OPENCLAW_HOME ??
+      path.join(
+        os.homedir(),
+        process.env.OPENCLAW_PROFILE
+          ? `.openclaw-${process.env.OPENCLAW_PROFILE}`
+          : '.openclaw',
+      );
+    const configPath = path.join(home, 'openclaw.json');
+    const raw = fs.readFileSync(configPath, 'utf8');
+    const cfg = JSON.parse(raw) as {
+      channels?: { feishu?: { appId?: string } };
+    };
+    const id = cfg?.channels?.feishu?.appId;
+    if (typeof id === 'string' && id) {
+      cachedOwnAppId = id;
+      return cachedOwnAppId;
+    }
+  } catch {
+    // missing file / unparseable / no field — fall through to ''
+  }
+  cachedOwnAppId = '';
+  return cachedOwnAppId;
+}
+
 /**
  * Extract mentions from a `message_received` event's content. Feishu's
  * canonical text content for a group message that @-mentions a bot is e.g.:
@@ -393,6 +446,23 @@ export function computeGateDecision(opts: {
  *   inbound messages pre-mention-gate (the smoke test for Scenario A).
  */
 export function register(api: GateApi): void {
+  // Startup diagnostic: resolve bot identity now (fires the cached
+  // /bot/v3/info call) so a misconfiguration shows up at gateway boot with
+  // a clear log line — not later when the first user message goes unread.
+  // PM-P0-3: "missing scope failure is silent" was the original complaint.
+  void getBotOpenId().then((openId) => {
+    const appId = getOwnAppId();
+    if (openId) {
+      log(api, 'info', `bot identity resolved open_id=${openId}${appId ? ` app_id=${appId}` : ''}`);
+    } else {
+      log(
+        api,
+        'error',
+        'bot identity unresolved — lark-cli auth or im scopes missing; @-mention detection will degrade to mention-only group heuristic',
+      );
+    }
+  });
+
   const messageReceivedHandler = async (
     event: PluginHookMessageReceivedEvent,
     ctx: PluginHookMessageContext,
