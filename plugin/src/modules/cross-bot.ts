@@ -12,12 +12,18 @@
  *
  * Graduated brake (D = depth-after-this-turn = stored_depth + 1):
  *
- *   D ≤ 2  → normal @-back
- *   D = 3  → soft hint injected into system prompt, @-back still applied
- *   D = 4  → stronger hint injected, @-back still applied
- *   D ≥ 5  → @-back is DROPPED; peer's mention gate (im:message.group_at_msg)
- *            won't fire on a non-@-prefixed reply, so the peer doesn't get
- *            triggered and the chain dies naturally
+ *   D < maxDepth  → normal @-back (no prompt manipulation)
+ *   D ≥ maxDepth  → @-back is DROPPED; peer's mention gate
+ *                   (im:message.group_at_msg) won't fire on a non-@-prefixed
+ *                   reply, so the peer doesn't get triggered and the chain
+ *                   dies naturally
+ *
+ * Why no prompt-injection at intermediate depths: an earlier design injected
+ * "soft hints" at D=3 and D=4 ("you've been going back-and-forth, consider
+ * wrapping up"). Live testing showed the LLM took the wrap-up instruction
+ * too literally and started producing empty content — single-token replies
+ * that consist of nothing but the @-back tag. We removed the hints; the only
+ * lever now is the @-back drop at D=maxDepth.
  *
  * Why no "hard skip" stage: OpenClaw's harness consumes only the
  * systemPrompt-style fields from before_prompt_build's return value (see
@@ -36,15 +42,17 @@
  *       by a human (or any non-bot sender).
  *
  *   `before_prompt_build`:
- *     - Reads stored depth and decides which brake stage applies.
+ *     - Reads stored depth and decides whether to mark the drop-@ flag.
  *     - At D ≥ maxDepth: marks dropAtBackKey so `llm_output` strips @-back.
- *     - At D = 3 or 4: injects the corresponding hint into the system prompt.
  *     - The legacy `{ skip: true }` return is kept as a log/debug signal
  *       only — it does NOT short-circuit the reply (host doesn't honor it).
  *
  *   `llm_output`:
  *     - Prepends `<at user_id="…"></at>` to the reply text, subject to the
  *       atBack* config flags and the depth-N drop-@-back rule.
+ *     - If the LLM produced empty content this turn, skips the @-back
+ *       entirely (don't manufacture an "@peer" message with no body —
+ *       that's worse than a silent reply).
  *
  *   `inbound_claim`:
  *     - Module A owns this hook for transcript capture. Module D doesn't
@@ -70,14 +78,10 @@ import {
 
 const LOG_PREFIX = '[feishu-collab]';
 
-// Hint copy — kept inline so there's no separate i18n surface to wire up.
-const HINT_D3 =
-  '你已经和另一个 bot 来回了 3 轮,如果话题接近收束,本轮做一个总结也很合适。';
-const HINT_D4 =
-  '你已经和另一个 bot 来回了 4 轮,强烈建议本轮做一个收束,把后续交回给人类参与者。';
-
-// Decision thresholds — match spec exactly. Configurable via crossBot.loopGuard.*
-// but defaults below make the module install-and-go.
+// Decision thresholds. Configurable via crossBot.loopGuard.*; defaults make
+// the module install-and-go. `softHintAtDepth` is deprecated (the hint
+// injection was removed after live testing showed it caused the LLM to
+// produce empty replies) but kept on the schema for backward compat.
 const DEFAULT_SOFT_HINT_AT_DEPTH = 3;
 const DEFAULT_MAX_DEPTH = 5;
 
@@ -419,17 +423,17 @@ function dropAtBackKey(chatId: string, peerAppId: string): string {
 }
 
 /**
- * Pre-compute the hint / brake decision for the *next* outbound, given the
+ * Pre-compute the brake decision for the *next* outbound, given the
  * inbound we just observed. Returns:
- *   - skip:   true if D ≥ maxDepth+1 → host should not generate a reply
- *   - dropAt: true if D === maxDepth → reply goes out without @-back
- *   - hint:   non-empty when D === softHintAtDepth or softHintAtDepth+1
+ *   - skip:   true if D > maxDepth → host should not generate a reply
+ *             (log-only signal; OpenClaw doesn't honor it — dropAt is what
+ *              actually breaks the chain)
+ *   - dropAt: true if D ≥ maxDepth → reply goes out without @-back
  *   - nextD:  the projected depth if we DO reply
  */
 interface BrakeDecision {
   skip: boolean;
   dropAt: boolean;
-  hint: string;
   nextD: number;
 }
 
@@ -441,7 +445,6 @@ function decideBrake(
   const decision: BrakeDecision = {
     skip: false,
     dropAt: false,
-    hint: '',
     nextD,
   };
   if (!cfg.loopGuardEnabled) return decision;
@@ -463,48 +466,10 @@ function decideBrake(
     if (nextD > cfg.maxDepth) decision.skip = true; // log-only signal
     return decision;
   }
-  if (nextD === cfg.softHintAtDepth) decision.hint = HINT_D3;
-  else if (nextD === cfg.softHintAtDepth + 1) decision.hint = HINT_D4;
+  // No prompt-injection at intermediate depths — see header comment.
+  // softHintAtDepth is kept on the config schema as a deprecated no-op
+  // for backward compatibility with old config files.
   return decision;
-}
-
-/**
- * Inject a hint into a system prompt structure. We accept a few common shapes:
- *   - `event.systemPrompt` (string)             → append
- *   - `event.system` (string)                   → append
- *   - `event.messages` (array, message[0].role==='system') → append to content
- *   - none of the above                          → set `event.systemPromptHint`
- *     as a fallback the host may pick up
- */
-function injectSystemHint(event: unknown, hint: string): void {
-  if (!event || typeof event !== 'object' || !hint) return;
-  const e = event as Record<string, unknown>;
-  const appended = (existing: string) =>
-    existing ? `${existing}\n\n[loop-guard hint]\n${hint}` : `[loop-guard hint]\n${hint}`;
-
-  if (typeof e.systemPrompt === 'string') {
-    e.systemPrompt = appended(e.systemPrompt);
-    return;
-  }
-  if (typeof e.system === 'string') {
-    e.system = appended(e.system);
-    return;
-  }
-  const msgs = e.messages;
-  if (Array.isArray(msgs)) {
-    const sysMsg = msgs.find(
-      (m): m is Record<string, unknown> =>
-        !!m && typeof m === 'object' && (m as Record<string, unknown>).role === 'system',
-    );
-    if (sysMsg && typeof sysMsg.content === 'string') {
-      sysMsg.content = appended(sysMsg.content);
-      return;
-    }
-    // No system message yet → prepend one.
-    msgs.unshift({ role: 'system', content: appended('') });
-    return;
-  }
-  e.systemPromptHint = hint;
 }
 
 // ---------------------------------------------------------------------------
@@ -613,16 +578,6 @@ export function register(api: PluginApi): void {
       return { skip: true, reason: 'feishu-collab:cross-bot:hard-skip' };
     }
 
-    if (decision.hint) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `${LOG_PREFIX} cross-bot soft-hint depth=${decision.nextD} peer=${peerKey}`,
-      );
-      injectSystemHint(event, decision.hint);
-      // Also stash for any handler that prefers pull semantics.
-      hints.set(summary.chatId, peerKey, decision.hint);
-    }
-
     return undefined;
   });
 
@@ -662,6 +617,19 @@ export function register(api: PluginApi): void {
     }
 
     const existing = readOutboundText(event);
+    // Skip @-back if the model produced no substantive content this turn.
+    // Otherwise we'd ship a message that's just "<at user_id=…></at>" with
+    // no body — worse than letting the empty reply through (Feishu drops
+    // empty messages, and even if it didn't, the peer's model gets a
+    // useless trigger). Observed in bot-vs-bot tests when the model
+    // occasionally returns a single-token reply.
+    if (existing.trim().length === 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `${LOG_PREFIX} cross-bot at-back-skipped reason=empty-llm-output target=${summary.senderOpenId}`,
+      );
+      return undefined;
+    }
     const prefix = buildAtPrefix(summary.senderOpenId);
     // Idempotency — if the LLM already produced an @-tag for this user,
     // don't double up.

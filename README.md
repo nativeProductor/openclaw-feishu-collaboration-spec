@@ -102,18 +102,20 @@ The store includes every message the plugin sees, including the host bot's own o
 
 ### Bot-to-bot loop guard
 
-When two bots are @-ing each other in the same group, the plugin gradually fades the exchange so it can't loop forever:
+When two bots are @-ing each other in the same group, the plugin breaks the chain at a configured depth so it can't loop forever:
 
 | Turn (depth) | Behavior |
 |---|---|
-| 1–2 | Normal @-back reply |
-| **3** | Inject a soft hint into the system prompt: "you've been going back-and-forth 3 turns, a summary is welcome"; @-back still applied |
-| **4** | Stronger hint: "strongly suggest wrapping up"; @-back still applied |
-| **5+** | @-back is **dropped**. The reply still goes out, but without an `<at>` prefix — the peer bot's mention-gate (the `im:message.group_at_msg` scope) won't fire, so the peer never gets a `message_received` event, and the chain dies. |
+| `1 .. maxDepth-1` | Normal @-back reply |
+| **`maxDepth` and beyond** | @-back is **dropped**. The reply still goes out, but without an `<at>` prefix — the peer bot's mention-gate (the `im:message.group_at_msg` scope) won't fire, so the peer never gets a `message_received` event, and the chain dies. |
 
-Note: there's no "hard skip = don't reply at all" stage. OpenClaw's `before_prompt_build` hook can't actually short-circuit a reply (the SDK only consumes prompt-modification fields from the hook return value). Dropping the @-back IS our effective skip, because the chain only continues if the next bot receives an `@-mention` event from Feishu.
+That's the whole brake. We do not inject "wrap up" prompts at intermediate depths — an earlier design did, but live testing showed the LLM took the wrap-up instruction too literally and produced empty replies. The drop-@ at `maxDepth` is the only real lever.
 
-Any human turn in the chat resets the depth counter for every peer. The default `maxDepth: 5` matches Feishu's guidance for autonomous bot exchanges; adjust via `crossBot.loopGuard.maxDepth` if your use case needs longer dialogues.
+There's also no "hard skip = don't reply at all" stage: OpenClaw's `before_prompt_build` hook can't actually short-circuit a reply (the SDK only consumes prompt-modification fields from the hook return value). Dropping the @-back is the effective skip.
+
+Empty-output safety: if the LLM produces no content this turn (no text at all), Module D skips the @-back rewrite entirely — better an empty reply than a bare `<at>` tag with no body.
+
+Any human turn in the chat resets the depth counter for every peer. The default `maxDepth: 5` matches Feishu's guidance for autonomous bot exchanges; adjust via `crossBot.loopGuard.maxDepth` if your use case needs longer dialogues. The legacy `crossBot.loopGuard.softHintAtDepth` config field is accepted but is now a no-op.
 
 ## Repo layout
 
