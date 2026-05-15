@@ -53,18 +53,14 @@ See [`docs/INTRO-zh.md`](docs/INTRO-zh.md) for the Chinese introduction.
 ```bash
 # in any OpenClaw profile, once published to npm:
 openclaw plugins install openclaw-feishu-collaboration-spec
-openclaw config patch --stdin <<EOF
-{
-  plugins: {
-    entries: {
-      "feishu-collab": {
-        enabled: true,
-        hooks: { allowConversationAccess: true }
-      }
-    }
-  }
-}
-EOF
+
+# `openclaw plugins install` rewrites the entry on every reinstall, so the
+# `hooks.allowConversationAccess` flag (required for non-bundled plugins to
+# receive llm_output/agent_end) needs to be (re)set. Use the helper:
+node scripts/ensure-hooks.mjs           # uses OPENCLAW_HOME or ~/.openclaw
+# or for a named profile:
+OPENCLAW_HOME=~/.openclaw-myprofile node scripts/ensure-hooks.mjs
+
 # restart the gateway daemon to load the plugin
 ```
 
