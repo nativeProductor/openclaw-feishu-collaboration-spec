@@ -453,6 +453,14 @@ export function register(api: PluginApi): void {
     const summary = parseInboundSummary(event, ctx);
     if (!summary.chatId && !summary.senderOpenId) return undefined;
     setPendingInbound(sessionKey, summary);
+    // Note: OpenClaw's message_received event does NOT carry `sender_type` —
+    // metadata exposes {to, provider, surface, originatingChannel, messageId,
+    // senderId, senderName} but no user-vs-app discriminator. To distinguish
+    // human from bot peers we'd need to either (a) cache `im.v1.chats.members.bots`
+    // per chat, (b) lookup via `messages-mget` per message, or (c) hit
+    // contact/v3/users and treat 41050 as "is a bot". TODO for the bot-bot
+    // brake; currently we treat unknown sender_type as human (no brake), which
+    // is the safe default. The @-back rewrite still works in both cases.
     // eslint-disable-next-line no-console
     console.log(
       `${LOG_PREFIX} cross-bot inbound-cached chat=${summary.chatId} sender=${summary.senderOpenId || '?'} type=${summary.senderType || '?'}`,
