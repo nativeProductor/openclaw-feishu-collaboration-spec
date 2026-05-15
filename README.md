@@ -4,7 +4,7 @@
 
 A supplemental plugin (and a specification) on top of **OpenClaw** + **lark-cli**. Its primary job: give every `@bot` reply the full recent group conversation as context. Secondary: let bots collaborate naturally with each other when relevant, with a graduated brake that lets bot↔bot dialogue fade instead of hard-stopping.
 
-**Status**: v0.1 in active development. Skeleton + architecture + QA plan complete. Modules A/B/C/D implementation in progress.
+**Status**: v0.1 shipped. All four modules (A/B/C/D) are live and end-to-end verified against a real bot-vs-bot conversation through every brake stage (D=1..6). See `docs/INTRO-zh.md` for the Chinese product write-up.
 
 ## Why
 
@@ -35,7 +35,7 @@ They are decoupled. Any OpenClaw + lark-cli deployment can install this plugin t
 | **A. Capture** | On every `message_received` event, append a normalized record to a per-chat JSONL store. Each capture also kicks off an async API backfill that pulls in messages Feishu's WebSocket omits (peer-bot non-@ msgs — by Feishu design they're never pushed via events). | every inbound msg | shipped |
 | **B. Reply Gate** | In groups, bot replies only when @-mentioned. P2P chats always reply. | every group inbound | shipped |
 | **C. Context Inject** | Inject the last-N group messages into the system prompt before each reply. Reads from Module A's local JSONL first (~10ms); falls back to a live Feishu API call only when the local store is too sparse (cold-start chats). | every reply turn | shipped |
-| **D. Cross-Bot @-back** | Every reply in a group prepends `<at user_id="...">` for the sender — works for both user@bot and bot@bot. Graduated brake on bot↔bot chains: depth 3 soft hint → 4 stronger hint → 5 drop the @-back (peer's mention gate filters it, chain fades) → 6+ hard skip. Human turns reset the depth counter. | every reply | shipped |
+| **D. Cross-Bot @-back** | Every reply in a group prepends `<at user_id="...">` for the sender — works for both user@bot and bot@bot. Graduated brake on bot↔bot chains: depth 3 soft hint → 4 stronger hint → 5+ drops the @-back so peer's mention gate filters our reply and the chain fades. Human turns reset the depth counter. | every reply | shipped |
 
 **Module C is the headline.** A/B/D exist to make C feel right in practice.
 
@@ -43,9 +43,9 @@ See [`docs/INTRO-zh.md`](docs/INTRO-zh.md) for the Chinese introduction.
 
 ## Design invariants (locked)
 
-1. **Zero-topology config**. The plugin's config schema contains no `chat_id` / `open_id` / `app_id` lists. Everything is runtime-discovered.
-2. **Install-and-go**. One `openclaw plugins install …` command. No per-group setup, no `lark-cli config bind`, no app-id mapping by hand.
-3. **Sane defaults**. `gate.mode=mention-only`, `crossBot.atBack=true`, `context.enabled=true`, `loop.maxDepth=5`. Touch nothing and you get the intended behavior.
+1. **No topology in config**. The plugin's config schema contains no `chat_id` / `open_id` / `app_id` lists. Bot identity and chat membership are resolved at runtime (`/bot/v3/info` for the running bot's own open_id; `/chats/{chat_id}/members/bots` for peer identification).
+2. **Install-and-go**. Three commands (install / `ensure-hooks.mjs` / restart). No per-group setup, no `lark-cli config bind`, no hand-mapping app_ids.
+3. **Sane defaults**. `gate.mode=mention-only`, `crossBot.atBackHumans=true`, `crossBot.atBackBots=true`, `context.enabled=true`, `crossBot.loopGuard.maxDepth=5`, `context.lastN=20`. Touch nothing and you get the intended behavior.
 4. **Reuse the model's existing tool surface**. The agent sees one `memory_search` tool, not two — our store is a corpus supplement, not a parallel API.
 
 ## Install
@@ -92,6 +92,12 @@ Set these in the feishu.cn console under your bot's app:
 ### First-reply latency
 
 Module C reads context from a local JSONL store that Module A populates as events arrive. On a **cold chat** (no captured history yet) the first reply falls back to a live Feishu API call and takes **~1–2 seconds**. Subsequent replies in the same chat are **<200 ms** as the local store warms up.
+
+### Storage bounds
+
+Module A stores one JSONL file per chat under `~/.openclaw-<profile>/state/feishu-collab/transcripts/<chat_id>.jsonl`. Per-chat cap: **2000 entries**, rotated to the most recent 1333 on overflow via atomic temp+rename. There is intentionally no time-based TTL — a chat that goes quiet for months keeps its last 1333 entries, ready for whenever someone re-engages. Per-chat size sits around ~1 MB; 100 active chats fit in tens of MB.
+
+The store includes every message the plugin sees: humans (both @-mentioned and ambient), other bots (@-mentioned via WebSocket events; non-@ messages backfilled via REST), but **not** the host bot's own outbound replies (the model's session already has those as assistant turns; storing them in the context block would double-count).
 
 ### Bot-to-bot loop guard
 
