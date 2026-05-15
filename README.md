@@ -87,6 +87,7 @@ Set these in the feishu.cn console under your bot's app:
 
 - `im:message` — read recent group messages via API (used by Module A's backfill and Module C's cold-start fallback)
 - `im:message.group_at_msg` — receive @-mention events for the bot
+- `im:message.group_msg` — receive non-@ user messages in groups (so Module A captures them live; without this, non-@ user messages only land in the transcript when the next API backfill runs)
 - `im:chat.members:read` — list bot members of a chat (used by Module D to identify peer bots vs humans)
 
 ### First-reply latency

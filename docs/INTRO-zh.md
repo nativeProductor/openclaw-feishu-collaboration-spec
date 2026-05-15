@@ -78,6 +78,7 @@ openclaw gateway restart
 |---|---|
 | `im:message` | 通过 API 拉群消息历史 |
 | `im:message.group_at_msg` | 接收"@ 自己"的事件 |
+| `im:message.group_msg` | 接收群里非 @ 的用户消息事件（让 Module A 实时入库，不依赖 backfill） |
 | `im:chat.members:read` | 区分群成员是人还是 bot（刹车需要） |
 
 后台开权限后记得发版。
