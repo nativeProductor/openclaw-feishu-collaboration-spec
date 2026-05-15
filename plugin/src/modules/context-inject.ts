@@ -18,9 +18,15 @@
 //
 // Module A's transcript SQLite store is still under research (the inbound_claim
 // scope question — see docs/architecture.md). Until it lands, we fetch on every
-// reply turn via:
+// reply turn via the raw open-api list endpoint:
 //
-//   lark-cli im chats.messages list --chat-id <chat_id> --page-size <N+5>
+//   lark-cli api GET /open-apis/im/v1/messages \
+//     --params '{"container_id_type":"chat","container_id":"<oc_…>","page_size":<N+5>,"sort_type":"ByCreateTimeDesc"}' \
+//     --as bot
+//
+// We deliberately bypass the `+chat-messages-list` shortcut, which adds
+// `only_thread_root_messages=true` and filters out every threaded reply —
+// the dominant shape in active group chats.
 //
 // We over-fetch slightly because we filter out:
 //   - the current trigger message (matched by message_id)
@@ -352,6 +358,13 @@ export function formatContextBlock(opts: {
 /**
  * Fetch and format the last-N transcript block for a chat. Returns null on
  * any failure (caller logs + degrades gracefully).
+ *
+ * Implementation note: we call the raw open-api endpoint
+ * (`/open-apis/im/v1/messages`) via `lark-cli api GET --params <json>` instead
+ * of the `+chat-messages-list` shortcut. The shortcut implicitly sends
+ * `only_thread_root_messages=true`, which silently filters out all threaded
+ * replies — the dominant message shape in active group chats. Calling the
+ * endpoint directly lets us omit that param and get the full transcript.
  */
 export async function fetchContextBlock(opts: {
   chatId: string;
@@ -359,17 +372,23 @@ export async function fetchContextBlock(opts: {
   triggerMessageId?: string;
   botOpenId: string | null;
 }): Promise<FormattedContext | { error: string }> {
-  const pageSize = String(opts.lastN + OVERFETCH_PAD);
+  const pageSize = opts.lastN + OVERFETCH_PAD;
+  const params = JSON.stringify({
+    container_id_type: 'chat',
+    container_id: opts.chatId,
+    page_size: pageSize,
+    sort_type: 'ByCreateTimeDesc',
+  });
   try {
     const envelope = await runLarkCliJson<LarkListMessagesEnvelope>(
       [
-        'im',
-        'chats.messages',
-        'list',
-        '--chat-id',
-        opts.chatId,
-        '--page-size',
-        pageSize,
+        'api',
+        'GET',
+        '/open-apis/im/v1/messages',
+        '--params',
+        params,
+        '--as',
+        'bot',
       ],
       { timeoutMs: 12_000 },
     );
