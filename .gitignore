@@ -47,8 +47,9 @@ plugin/TEST-PLAN.md
 # Local test harness (lark-cli wrappers for sending stimuli + log watching)
 harness/
 
-# Dev bootstrap scripts (spin up a local dev bot, sync local doc to Feishu)
-scripts/
+# Dev bootstrap scripts (spin up a local dev bot, sync local doc to Feishu).
+# Use scripts/* (not scripts/) so the negation below can re-include files.
+scripts/*
 # …but ensure-hooks.mjs is a user-facing runtime helper (referenced by
 # README install instructions), not a dev artifact — keep it tracked.
 !scripts/ensure-hooks.mjs
