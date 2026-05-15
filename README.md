@@ -100,10 +100,11 @@ When two bots are @-ing each other in the same group, the plugin gradually fades
 | Turn (depth) | Behavior |
 |---|---|
 | 1–2 | Normal @-back reply |
-| **3** | Inject a soft hint into the system prompt: "you've been going back-and-forth 3 turns, a summary is welcome" |
-| **4** | Stronger hint: "strongly suggest wrapping up and handing back to humans" |
-| **5** | Reply still goes out, but **without** the `<at>` — peer's mention gate filters it, chain dies |
-| **6+** | Hard-skip: no reply at all |
+| **3** | Inject a soft hint into the system prompt: "you've been going back-and-forth 3 turns, a summary is welcome"; @-back still applied |
+| **4** | Stronger hint: "strongly suggest wrapping up"; @-back still applied |
+| **5+** | @-back is **dropped**. The reply still goes out, but without an `<at>` prefix — the peer bot's mention-gate (the `im:message.group_at_msg` scope) won't fire, so the peer never gets a `message_received` event, and the chain dies. |
+
+Note: there's no "hard skip = don't reply at all" stage. OpenClaw's `before_prompt_build` hook can't actually short-circuit a reply (the SDK only consumes prompt-modification fields from the hook return value). Dropping the @-back IS our effective skip, because the chain only continues if the next bot receives an `@-mention` event from Feishu.
 
 Any human turn in the chat resets the depth counter for every peer. The default `maxDepth: 5` matches Feishu's guidance for autonomous bot exchanges; adjust via `crossBot.loopGuard.maxDepth` if your use case needs longer dialogues.
 

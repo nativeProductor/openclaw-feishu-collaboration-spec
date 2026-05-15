@@ -13,34 +13,38 @@
  * Graduated brake (D = depth-after-this-turn = stored_depth + 1):
  *
  *   D ≤ 2  → normal @-back
- *   D = 3  → log soft-hint, inject hint into system prompt
- *   D = 4  → log soft-hint, inject stronger hint
- *   D = 5  → drop the @-back (reply goes out plain); peer's mention gate
- *            filters it, conversation fades
- *   D ≥ 6  → hard-skip: do not reply at all
+ *   D = 3  → soft hint injected into system prompt, @-back still applied
+ *   D = 4  → stronger hint injected, @-back still applied
+ *   D ≥ 5  → @-back is DROPPED; peer's mention gate (im:message.group_at_msg)
+ *            won't fire on a non-@-prefixed reply, so the peer doesn't get
+ *            triggered and the chain dies naturally
+ *
+ * Why no "hard skip" stage: OpenClaw's harness consumes only the
+ * systemPrompt-style fields from before_prompt_build's return value (see
+ * agent-harness-runtime: `resolveAgentHarnessBeforePromptBuildResult`).
+ * A `{skip: true}` return is silently discarded — the bot replies anyway.
+ * The drop-@ mechanism IS our effective skip: a reply with no @-mention
+ * doesn't propagate the chain, since the peer's WebSocket only delivers
+ * @-events to its OpenClaw instance.
  *
  * Hook bookkeeping (which hook does what):
  *
  *   `agent_end`:
  *     - The most reliable hook for "we just replied". We use it to bump
- *       depth for (chat_id, peer_app_id) when the inbound we just answered
+ *       depth for (chat_id, peer) when the inbound we just answered
  *       was sent by a bot, and to RESET the chain when the inbound was sent
  *       by a human (or any non-bot sender).
- *     - After bumping, we *also* compute the soft hint for the NEXT turn
- *       (so if we're at depth=2 now, when the peer pings us again, our
- *       next pre-generation will pull D=3 and emit the soft hint).
  *
  *   `before_prompt_build`:
- *     - Reads stored depth and the pending hint registry.
- *     - If next-depth would be ≥ 6 → returns `{ skip: true }` to short-circuit.
- *     - If next-depth is 3 or 4 → injects the corresponding hint string into
- *       the system prompt.
- *     - Marks an in-band flag (via the pending hint registry) so the
- *       outbound-rewrite hook (`llm_output`) knows whether to drop the @-back.
+ *     - Reads stored depth and decides which brake stage applies.
+ *     - At D ≥ maxDepth: marks dropAtBackKey so `llm_output` strips @-back.
+ *     - At D = 3 or 4: injects the corresponding hint into the system prompt.
+ *     - The legacy `{ skip: true }` return is kept as a log/debug signal
+ *       only — it does NOT short-circuit the reply (host doesn't honor it).
  *
  *   `llm_output`:
  *     - Prepends `<at user_id="…"></at>` to the reply text, subject to the
- *       atBack* config flags and the depth-5 drop-@-back rule.
+ *       atBack* config flags and the depth-N drop-@-back rule.
  *
  *   `inbound_claim`:
  *     - Module A owns this hook for transcript capture. Module D doesn't
@@ -441,12 +445,22 @@ function decideBrake(
     nextD,
   };
   if (!cfg.loopGuardEnabled) return decision;
-  if (nextD >= cfg.maxDepth + 1) {
-    decision.skip = true;
-    return decision;
-  }
-  if (nextD === cfg.maxDepth) {
+  // Brake architecture, post-live-verification:
+  //
+  // We can't ACTUALLY skip the reply from before_prompt_build —
+  // OpenClaw's harness only consumes systemPrompt-style fields from the
+  // hook result; a `{skip: true}` return is silently discarded (see
+  // agent-harness-runtime: `resolveAgentHarnessBeforePromptBuildResult`).
+  // So the only real lever we have is the @-back at llm_output time.
+  //
+  // Drop the @-back at maxDepth or higher → the peer's mention gate
+  // (im:message.group_at_msg scope) won't fire on a non-@-prefixed reply,
+  // chain dies. That IS the effective hard-skip in our setup. The
+  // `skip` flag below is kept as a log signal but doesn't change runtime
+  // behavior; the dropAt is what actually matters.
+  if (nextD >= cfg.maxDepth) {
     decision.dropAt = true;
+    if (nextD > cfg.maxDepth) decision.skip = true; // log-only signal
     return decision;
   }
   if (nextD === cfg.softHintAtDepth) decision.hint = HINT_D3;
@@ -572,27 +586,31 @@ export function register(api: PluginApi): void {
     const storedDepth = store.getDepth(summary.chatId, peerKey);
     const decision = decideBrake(storedDepth, cfg);
 
-    if (decision.skip) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `${LOG_PREFIX} cross-bot hard-skip depth=${decision.nextD} peer=${peerKey}`,
-      );
-      // Signal skip back to the host. We return an object the host can
-      // consult; we also try the common boolean shape just in case.
-      return { skip: true, reason: 'feishu-collab:cross-bot:hard-skip' };
-    }
-
+    // IMPORTANT: dropAt must be written BEFORE the skip-return path,
+    // because `skip` is just a log signal — OpenClaw's harness ignores
+    // the return value's `skip` field. The actual chain-break mechanism
+    // is the dropped @-back at llm_output time.
     if (decision.dropAt) {
       // eslint-disable-next-line no-console
       console.log(
         `${LOG_PREFIX} cross-bot drop-at depth=${decision.nextD} peer=${peerKey}`,
       );
-      // Stash a marker the outbound-rewrite hook will read.
       hints.set(
         summary.chatId,
         dropAtBackKey(summary.chatId, peerKey),
         '1',
       );
+    }
+
+    if (decision.skip) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `${LOG_PREFIX} cross-bot hard-skip depth=${decision.nextD} peer=${peerKey}`,
+      );
+      // We still return a `skip` marker for observability / future SDK
+      // support, but the host ignores it today — the dropAt above is
+      // what actually severs the chain.
+      return { skip: true, reason: 'feishu-collab:cross-bot:hard-skip' };
     }
 
     if (decision.hint) {
