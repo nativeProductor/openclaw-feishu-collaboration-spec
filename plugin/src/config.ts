@@ -11,9 +11,7 @@ export const FeishuCollabConfig = Type.Object({
 
   gate: Type.Optional(
     Type.Object({
-      mode: Type.Optional(
-        Type.Union([Type.Literal('mention-only'), Type.Literal('autonomous')]),
-      ),
+      mode: Type.Optional(Type.Literal('mention-only')),
     }),
   ),
 

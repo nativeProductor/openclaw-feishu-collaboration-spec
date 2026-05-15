@@ -1,4 +1,4 @@
-// Module B — Reply Gate (P0: mention-only mode).
+// Module B — Reply Gate (mention-only).
 //
 // Verify:
 //   1. Send no-@ msg in a group → log [feishu-collab] gate-decision: skip (reason=no-mention)
@@ -6,9 +6,8 @@
 //   2. Send @-bot msg in a group → log [feishu-collab] gate-decision: reply
 //                              → model runs normally
 //   3. Send p2p (1:1) msg       → log [feishu-collab] gate-decision: reply (reason=p2p-bypass)
-//   4. Switch gate.mode=autonomous → log [feishu-collab] gate-decision: skip (reason=autonomous-mode-stub)
-//                              → real autonomous behaviour lands in Phase 2
 //
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Why two hooks (message_received + before_prompt_build):
 //
@@ -150,7 +149,7 @@ function consumePendingGate(sessionKey: string | undefined): GateDecision | unde
   return entry.decision;
 }
 
-export type GateMode = 'mention-only' | 'autonomous';
+export type GateMode = 'mention-only';
 
 export type GateDecision = {
   outcome: 'reply' | 'skip';
@@ -219,13 +218,10 @@ function log(api: GateApi, level: 'info' | 'warn' | 'error', msg: string) {
   console.log(line);
 }
 
-function readGateMode(api: GateApi): GateMode {
-  const cfg = api.pluginConfig as
-    | { gate?: { mode?: string } | undefined }
-    | undefined;
-  const raw = cfg?.gate?.mode;
-  if (raw === 'autonomous') return 'autonomous';
-  // Default + any unknown value collapses to mention-only (safer).
+function readGateMode(_api: GateApi): GateMode {
+  // Only `mention-only` is supported. The field is kept on the config
+  // schema for future extensibility but currently always resolves to
+  // mention-only — unknown values are coerced silently.
   return 'mention-only';
 }
 
@@ -347,12 +343,8 @@ export function computeGateDecision(opts: {
   if (!opts.isGroup) {
     return { outcome: 'reply', reason: 'p2p-bypass' };
   }
-  if (opts.mode === 'autonomous') {
-    // P0: stub. Real classifier lands in Phase 2.
-    return { outcome: 'skip', reason: 'autonomous-mode-stub' };
-  }
 
-  // mention-only mode.
+  // mention-only mode (the only supported mode).
   //
   // Reality at the channel layer: Feishu strips `<at user_id="ou_...">` tags
   // out of `event.content` before delivering the message_received event, so

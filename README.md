@@ -33,7 +33,7 @@ They are decoupled. Any OpenClaw + lark-cli deployment can install this plugin t
 | Module | Capability | Who triggers it | Status |
 |---|---|---|---|
 | **A. Capture** | Hooks `inbound_claim` to record **every** group message — even ones not @-mentioning the bot — into a local per-group SQLite store | every inbound msg | scaffold |
-| **B. Reply Gate** | In groups, bot replies only when @-mentioned (`mention-only` default). P2P unchanged. Autonomous classifier mode is Phase 2 | every group inbound | scaffold |
+| **B. Reply Gate** | In groups, bot replies only when @-mentioned. P2P chats always reply. | every group inbound | scaffold |
 | **C. Context Inject** | When the bot does reply (to a user OR a bot), the last ~20 group msgs are injected into the prompt; same store also exposed via `memory_search` corpus supplement | every reply turn | scaffold |
 | **D. Cross-Bot @-back** | When the inbound was from another bot, auto-include `<at>` in the reply so the chain continues. Graduated brake at depth 3→5 makes it fade naturally | bot-from-bot inbound | scaffold |
 

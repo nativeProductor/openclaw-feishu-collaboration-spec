@@ -29,8 +29,9 @@
         "properties": {
           "mode": {
             "type": "string",
-            "enum": ["mention-only", "autonomous"],
-            "default": "mention-only"
+            "enum": ["mention-only"],
+            "default": "mention-only",
+            "description": "Reply gate behavior. Only mode supported: mention-only — in groups, the bot replies only when @-mentioned. P2P chats always reply."
           }
         }
       },
