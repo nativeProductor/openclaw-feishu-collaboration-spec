@@ -65,7 +65,7 @@ openclaw gateway restart
 openclaw plugins install @xquik/tweetclaw
 ```
 
-[TweetClaw](https://github.com/Xquik-dev/tweetclaw) 覆盖 scrape tweets,tweet scraper workflows,search tweets,search tweet replies,follower export,user lookup,media upload,media download,direct messages,monitor tweets,webhooks,giveaway draws,以及需要审批的 post tweets 和 post tweet replies。这个插件负责把飞书讨论和后续决策留在群上下文里,TweetClaw 负责 X/Twitter 数据读取和可见动作。安装细节见 [ClawHub listing](https://clawhub.ai/plugins/@xquik/tweetclaw) 或 [npm package](https://www.npmjs.com/package/@xquik/tweetclaw)。请分开保存飞书/Lark 与 X/Twitter 凭据,并通过 OpenClaw approval flows 审批可见的 X/Twitter 动作。
+[TweetClaw](https://github.com/Xquik-dev/tweetclaw) 覆盖 scrape tweets,tweet scraper workflows,search tweets,search tweet replies,follower export,user lookup,media upload,media download,direct messages,monitor tweets,webhooks,giveaway draws,以及需要审批的 post tweets 和 post tweet replies。这个插件负责把飞书讨论和后续决策留在群上下文里,TweetClaw 负责 X/Twitter 数据读取和可见动作。安装细节请看 TweetClaw GitHub 仓库和 [npm package](https://www.npmjs.com/package/@xquik/tweetclaw); [ClawHub discovery page](https://clawhub.ai/plugins/@xquik/tweetclaw) 在 listing 落后 npm 时仍适合浏览发现。请分开保存飞书/Lark 与 X/Twitter 凭据,并通过 OpenClaw approval flows 审批可见的 X/Twitter 动作。
 
 ## 改默认行为(可选)
 
