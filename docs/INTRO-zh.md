@@ -64,7 +64,7 @@ node scripts/ensure-hooks.mjs
 openclaw gateway restart
 ```
 
-第二步必须跑：`plugins install` 会重置钩子配置，这个脚本用来恢复；之后每次 reinstall 都要重跑一遍（这是已知问题，后续会想办法集成进 `plugins install` 主流程）。
+第二步必须跑：`plugins install` 会重置钩子配置，这个脚本用来恢复；之后每次 reinstall 都要重跑一遍。我们试过把它合进 `plugins install` 主流程，结论是 OpenClaw 当前架构上做不到完全自动化，原因写在了下面的常见问题里。
 
 启动日志里能看到这一行表示成功：
 
@@ -150,6 +150,22 @@ EOF
 不会。每个群一个 JSONL 文件，默认上限 2000 条；超出后保留最近 1333 条，旧消息丢弃。纯按条数算，没有按天数过期——群冷了不代表上下文要忘掉，下次激活时历史还在。
 
 容量估算：单条记录约 500 字节，单群最大约 1MB，100 个活跃群占用几十 MB。
+
+**Q：`ensure-hooks.mjs` 能合进 `plugins install` 一起跑吗？**
+
+短答：目前不行。长答：
+
+OpenClaw 的 `plugins install` 在跑 `npm install` 时硬编码了 `--ignore-scripts`（出于安全考虑，避免插件包通过 npm 钩子执行任意代码），所以普通的 `package.json` `postinstall` 钩子不会触发。
+
+SDK 里有一个 `registerConfigMigration` API，理论上可以让插件声明一个配置迁移，host 应用之后就不用手动跑脚本——我们已经写了 `setup-api.ts` 来用这个机制。但实际验证发现：这个迁移只在 `openclaw doctor --fix` 命令里跑，**不会**在 `plugins install` 或 gateway 启动时自动跑。
+
+所以现在有三种应对方式（任选一个）：
+
+1. **手动跑 `ensure-hooks.mjs`**（推荐）——脚本幂等，跑一次永久生效，直到下次 reinstall
+2. **跑 `openclaw doctor --fix`**——会触发 setup migration，效果一样
+3. **手动编辑 `~/.openclaw-<profile>/openclaw.json`**，在 `plugins.entries.feishu-collab` 里加 `"hooks": {"allowConversationAccess": true}`
+
+我们倾向于上游给 OpenClaw 提 PR 让 `plugins install` 自动跑 setup migration，但那是 OpenClaw 团队的事，不是这个插件能单方面解决的。
 
 ## 源码
 

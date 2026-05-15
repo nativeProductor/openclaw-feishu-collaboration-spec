@@ -33,6 +33,8 @@
     "runtimeExtensions": [
       "./dist/index.js"
     ],
+    "setupEntry": "./src/setup-api.ts",
+    "runtimeSetupEntry": "./dist/setup-api.js",
     "install": {
       "npmSpec": "openclaw-feishu-collaboration-spec",
       "defaultChoice": "npm",

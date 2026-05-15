@@ -37,6 +37,10 @@ const pluginEntry = definePluginEntry({
   register(api: any) {
     // eslint-disable-next-line no-console
     console.log(`${LOG_PREFIX} skel:register fired`);
+    // The hooks.allowConversationAccess setup migration lives in
+    // `setup-api.ts` — that's the only place where the migration can
+    // run BEFORE the host's hook-gating policy is evaluated. By the time
+    // this runtime `register` fires, the policy has already locked in.
     registerTranscriptCapture(api);
     registerReplyGate(api);
     registerContextInject(api);
