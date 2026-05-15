@@ -181,6 +181,82 @@ function readPluginCfgFromCtx(ctx: unknown): unknown {
   return c.config ?? c.pluginConfig ?? c.cfg;
 }
 
+// ---------------------------------------------------------------------------
+// Cross-hook inbound bridge
+//
+// The host fires `llm_output` and `agent_end` without an inbound payload on
+// `event`/`ctx` — Module B/C run into the same gap and use a sessionKey-keyed
+// Map to bridge from `message_received` to `before_prompt_build`. We do the
+// same so Module D's outbound @-back rewrite and depth bookkeeping can read
+// the inbound that triggered this turn.
+// ---------------------------------------------------------------------------
+
+interface CachedInbound {
+  summary: InboundSummary;
+  ts: number;
+}
+
+const inboundBySession = new Map<string, CachedInbound>();
+const INBOUND_CACHE_MAX = 256;
+
+function setPendingInbound(sessionKey: string, summary: InboundSummary): void {
+  if (!sessionKey) return;
+  inboundBySession.set(sessionKey, { summary, ts: Date.now() });
+  // Cap size; evict the oldest entry on overflow.
+  if (inboundBySession.size > INBOUND_CACHE_MAX) {
+    let oldestKey: string | undefined;
+    let oldestTs = Infinity;
+    for (const [k, v] of inboundBySession) {
+      if (v.ts < oldestTs) {
+        oldestTs = v.ts;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey) inboundBySession.delete(oldestKey);
+  }
+}
+
+function peekPendingInbound(sessionKey: string | undefined): InboundSummary | undefined {
+  if (!sessionKey) return undefined;
+  return inboundBySession.get(sessionKey)?.summary;
+}
+
+function evictPendingInbound(sessionKey: string | undefined): void {
+  if (!sessionKey) return;
+  inboundBySession.delete(sessionKey);
+}
+
+/** Extract sessionKey from event or ctx (host populates one of them). */
+function readSessionKey(event: unknown, ctx: unknown): string | undefined {
+  const e = event && typeof event === 'object' ? (event as Record<string, unknown>) : undefined;
+  const c = ctx && typeof ctx === 'object' ? (ctx as Record<string, unknown>) : undefined;
+  const candidates = [
+    e?.sessionKey,
+    (e as Record<string, unknown> | undefined)?.['session_key'],
+    c?.sessionKey,
+    (c as Record<string, unknown> | undefined)?.['session_key'],
+  ];
+  for (const v of candidates) {
+    if (typeof v === 'string' && v) return v;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the inbound summary for a hook that may not carry it directly.
+ * Tries event/ctx first (works for `before_prompt_build`); falls back to the
+ * sessionKey cache populated at `message_received` (needed for `llm_output`
+ * and `agent_end`).
+ */
+function resolveInboundSummary(event: unknown, ctx: unknown): InboundSummary {
+  // First try envelope/flat parsing on the live event+ctx.
+  const direct = parseInboundSummary(readInboundFromCtx(event, ctx), ctx);
+  if (direct.senderOpenId || direct.chatId) return direct;
+  // Fall back to the cache populated at message_received time.
+  const cached = peekPendingInbound(readSessionKey(event, ctx));
+  return cached ?? direct;
+}
+
 /**
  * Build the `<at>` prefix for an open_id. Feishu rich-text accepts
  * `<at user_id="ou_xxxx"></at>` to render an @-mention.
@@ -206,6 +282,15 @@ function readOutboundText(event: unknown): string {
     if (typeof o.text === 'string') return o.text;
     if (typeof o.content === 'string') return o.content;
   }
+  // OpenClaw `llm_output` event surfaces the model text as:
+  //   - event.lastAssistant: string  (the most recent assistant message)
+  //   - event.assistantTexts: string[] (all assistant turns this run)
+  if (typeof e.lastAssistant === 'string') return e.lastAssistant;
+  const ats = e.assistantTexts;
+  if (Array.isArray(ats) && ats.length > 0) {
+    const tail = ats[ats.length - 1];
+    if (typeof tail === 'string') return tail;
+  }
   return '';
 }
 
@@ -213,6 +298,20 @@ function readOutboundText(event: unknown): string {
 function writeOutboundText(event: unknown, newText: string): void {
   if (!event || typeof event !== 'object') return;
   const e = event as Record<string, unknown>;
+  // Prefer OpenClaw's llm_output canonical fields when present.
+  if (typeof e.lastAssistant === 'string') {
+    e.lastAssistant = newText;
+    const ats = e.assistantTexts;
+    if (Array.isArray(ats) && ats.length > 0) {
+      // Keep the array in sync so downstream readers see the same value.
+      ats[ats.length - 1] = newText;
+    }
+    return;
+  }
+  if (Array.isArray(e.assistantTexts) && e.assistantTexts.length > 0) {
+    e.assistantTexts[e.assistantTexts.length - 1] = newText;
+    return;
+  }
   if (typeof e.text === 'string') {
     e.text = newText;
     return;
@@ -342,11 +441,29 @@ export function register(api: PluginApi): void {
   const store = getLoopStateStore();
   const hints = getPendingHintRegistry();
 
+  // ---- message_received: stash inbound for llm_output/agent_end ----
+  // `message_received` is the only hook the host fires for every inbound with
+  // the full payload. `llm_output` and `agent_end` lack the inbound payload,
+  // so we cache the parsed summary keyed by sessionKey here and read it back
+  // in those later hooks.
+  api.on('message_received', async (event: unknown, ctx?: unknown) => {
+    const sessionKey = readSessionKey(event, ctx);
+    if (!sessionKey) return undefined;
+    // Pass ctx so the flat message_received shape resolves (chat_id is in ctx.conversationId).
+    const summary = parseInboundSummary(event, ctx);
+    if (!summary.chatId && !summary.senderOpenId) return undefined;
+    setPendingInbound(sessionKey, summary);
+    // eslint-disable-next-line no-console
+    console.log(
+      `${LOG_PREFIX} cross-bot inbound-cached chat=${summary.chatId} sender=${summary.senderOpenId || '?'} type=${summary.senderType || '?'}`,
+    );
+    return undefined;
+  });
+
   // ---- before_prompt_build: read depth, decide skip/hint, mark drop-@ ----
   api.on('before_prompt_build', async (event: unknown, ctx?: unknown) => {
     const cfg = readConfig(readPluginCfgFromCtx(ctx));
-    const inboundRaw = readInboundFromCtx(event, ctx);
-    const summary = parseInboundSummary(inboundRaw);
+    const summary = resolveInboundSummary(event, ctx);
 
     // Only operate in group chats. P2P has no loop dynamics.
     if (!isGroupChat(summary)) return undefined;
@@ -404,8 +521,7 @@ export function register(api: PluginApi): void {
   // ---- llm_output: rewrite outbound text to prepend @-back ----
   api.on('llm_output', async (event: unknown, ctx?: unknown) => {
     const cfg = readConfig(readPluginCfgFromCtx(ctx));
-    const inboundRaw = readInboundFromCtx(event, ctx);
-    const summary = parseInboundSummary(inboundRaw);
+    const summary = resolveInboundSummary(event, ctx);
 
     if (!isGroupChat(summary)) return undefined;
     if (!summary.senderOpenId) return undefined;
@@ -435,14 +551,23 @@ export function register(api: PluginApi): void {
     // Idempotency — if the LLM already produced an @-tag for this user,
     // don't double up.
     if (existing.includes(`user_id="${summary.senderOpenId}"`)) return undefined;
-    writeOutboundText(event, `${prefix}${existing}`);
+    const newText = `${prefix}${existing}`;
+    writeOutboundText(event, newText);
+    // eslint-disable-next-line no-console
+    console.log(
+      `${LOG_PREFIX} cross-bot reply-with-at target=${summary.senderOpenId} (sender=${summary.senderType || 'unknown'})`,
+    );
     return undefined;
   });
 
   // ---- agent_end: bump depth on bot-inbound replies, reset on human ----
+  // NOTE: do NOT evict the inbound cache here. In practice the host fires
+  // agent_end BEFORE llm_output completes (or the relative order is racy),
+  // so evicting on agent_end strands llm_output with an empty summary.
+  // The cache is bounded by INBOUND_CACHE_MAX (LRU-ish eviction on overflow),
+  // so leaving entries is safe and bounded.
   api.on('agent_end', async (event: unknown, ctx?: unknown) => {
-    const inboundRaw = readInboundFromCtx(event, ctx);
-    const summary = parseInboundSummary(inboundRaw);
+    const summary = resolveInboundSummary(event, ctx);
 
     if (!isGroupChat(summary) || !summary.chatId) return undefined;
 
@@ -456,6 +581,10 @@ export function register(api: PluginApi): void {
       // Any non-bot inbound that we just replied to resets the chain for
       // every peer in the chat — humans speaking re-zero the loop counters.
       store.resetChain(summary.chatId);
+      // eslint-disable-next-line no-console
+      console.log(
+        `${LOG_PREFIX} cross-bot depth reset chat=${summary.chatId} (human turn)`,
+      );
       return undefined;
     }
 
