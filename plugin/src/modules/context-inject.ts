@@ -392,6 +392,17 @@ function transcriptRecordToFeishuMessage(r: TranscriptRecord): FeishuMessage {
  * Read the last-N transcript block from Module A's local store. Returns
  * `null` when the store has fewer than `minRows` qualifying records (caller
  * falls back to the live API).
+ *
+ * Ordering note: the JSONL file is append-only with two writers — direct
+ * event-capture (Module A) and API backfill (transcript-backfill.ts). They
+ * write at different times, so the file's line order is NOT strictly
+ * chronological. We sort by `ts` desc here to recover the true ordering
+ * before handing off to `formatContextBlock`, which labels its output
+ * "latest first".
+ *
+ * To cap the cost of the sort we over-read by OVERFETCH_PAD records and
+ * trim post-sort to `lastN`, so we never pay more than O((lastN+pad) log)
+ * on the tail.
  */
 export function readContextBlockFromTranscript(opts: {
   chatId: string;
@@ -405,10 +416,10 @@ export function readContextBlockFromTranscript(opts: {
   // messages, so the raw tail must be larger than `lastN`.
   const records = getTranscriptStore().readTail(opts.chatId, opts.lastN + OVERFETCH_PAD);
   if (records.length < opts.minRows) return null;
+  // Sort newest-first. Stable enough for our needs — ts collisions are rare
+  // and inconsequential.
+  records.sort((a, b) => b.ts - a.ts);
   const messages = records.map(transcriptRecordToFeishuMessage);
-  // formatContextBlock expects newest-first; readTail returns chronological,
-  // so reverse here.
-  messages.reverse();
   return formatContextBlock({
     messages,
     botOpenId: opts.botOpenId,

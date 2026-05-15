@@ -26,6 +26,7 @@
 //   - No npm dep added.
 
 import { parseInboundSummary } from '../lib/feishu-payload.js';
+import { backfillChatTranscript } from '../lib/transcript-backfill.js';
 import { getTranscriptStore } from '../lib/transcript-store.js';
 
 const LOG_PREFIX = '[feishu-collab]';
@@ -89,6 +90,33 @@ function readMsgType(event: PluginHookMessageReceivedEvent): string {
   return 'text';
 }
 
+/**
+ * Best-effort: pull the host's own bot app_id from the ctx the hook
+ * receives. The backfill uses it to skip our own outbound replies. Defined
+ * inline (rather than imported from cross-bot) to keep Module A
+ * dependency-free relative to Module D. Mirrors `readOwnAppId` in
+ * cross-bot.ts.
+ */
+function readOwnAppId(ctx: unknown): string {
+  if (!ctx || typeof ctx !== 'object') return '';
+  const c = ctx as Record<string, unknown>;
+  const direct = c.botAppId ?? c.ownAppId ?? c.appId;
+  if (typeof direct === 'string') return direct;
+  const account = c.account;
+  if (account && typeof account === 'object') {
+    const a = account as Record<string, unknown>;
+    if (typeof a.appId === 'string') return a.appId;
+    if (typeof a.app_id === 'string') return a.app_id;
+  }
+  const channel = c.channel;
+  if (channel && typeof channel === 'object') {
+    const ch = channel as Record<string, unknown>;
+    if (typeof ch.appId === 'string') return ch.appId;
+    if (typeof ch.app_id === 'string') return ch.app_id;
+  }
+  return process.env.FEISHU_APP_ID || process.env.LARK_APP_ID || '';
+}
+
 export function register(api: CtxApi): void {
   const store = getTranscriptStore();
 
@@ -120,6 +148,21 @@ export function register(api: CtxApi): void {
         'debug',
         `transcript captured chat=${summary.chatId} sender=${summary.senderOpenId || '?'} type=${msgType} bytes=${content.length}`,
       );
+
+      // ─── Opportunistic backfill ───────────────────────────────────
+      // Feishu's WebSocket stream omits messages sent by *other* bots that
+      // don't @-mention us (per official docs: `im:message.group_msg`
+      // scope is "不含机器人消息"). The REST endpoint has the full history.
+      //
+      // After every event capture, fire-and-forget an API pull that
+      // dedups against the local store and merges in any messages we
+      // missed. Off the reply hot path; per-chat throttled to one call
+      // per ~3s. Never blocks event handling, never throws.
+      const ownAppId = readOwnAppId(ctx);
+      void backfillChatTranscript(summary.chatId, store, { ownAppId }).catch(() => {
+        // backfillChatTranscript itself never throws; this catch is
+        // belt-and-suspenders against any future signature drift.
+      });
     },
   );
 }
