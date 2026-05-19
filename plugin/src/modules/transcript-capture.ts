@@ -25,9 +25,10 @@
 //   - Plain text is grep-able from the shell during ops — useful for QA.
 //   - No npm dep added.
 
-import { parseInboundSummary } from '../lib/feishu-payload.js';
+import { parseInboundSummary, stripChannelPrefix } from '../lib/feishu-payload.js';
 import { backfillChatTranscript } from '../lib/transcript-backfill.js';
 import { getTranscriptStore } from '../lib/transcript-store.js';
+import { getOwnAppId } from './reply-gate.js';
 
 const LOG_PREFIX = '[feishu-collab]';
 
@@ -46,6 +47,23 @@ type PluginHookMessageContext = {
   channelId?: string;
   conversationId?: string;
   messageId?: string;
+};
+
+// Subset of the message_sent event. Per `toPluginMessageSentEvent` in
+// the SDK's message-hook-mappers, this fires for every outbound the host
+// sends and carries:
+//   - to:        e.g. "feishu:group:oc_xxx" or "feishu:ou_xxx" for p2p
+//   - content:   the text we just sent
+//   - success:   was send accepted by the channel
+//   - messageId: server-assigned id of the sent message (post-send)
+type PluginHookMessageSentEvent = {
+  to?: string;
+  content?: string;
+  success?: boolean;
+  messageId?: string;
+  sessionKey?: string;
+  runId?: string;
+  error?: unknown;
 };
 
 type CtxApi = {
@@ -141,6 +159,60 @@ export function register(api: CtxApi): void {
         // backfillChatTranscript itself never throws; this catch is
         // belt-and-suspenders against any future signature drift.
       });
+    },
+  );
+
+  // ─── message_sent: capture our OWN outbound ──────────────────────
+  // The host fires this hook on every outbound the bot sends, including
+  // thread replies. We subscribe here because:
+  //   - The bot never receives a `message_received` for its own outbound,
+  //     so without this hook the transcript only ever has incoming msgs.
+  //   - The API backfill in `transcript-backfill.ts` is supposed to catch
+  //     up via the REST endpoint, but Feishu's `/im/v1/messages` with
+  //     `container_id_type=chat` only returns the FIRST thread reply per
+  //     chat-root message — subsequent thread replies (which is most of
+  //     a bot-vs-bot conversation) are invisible to that API.
+  //   - `message_sent` fires regardless of routing and gives us the
+  //     final server-assigned message_id, so we can store these without
+  //     racing or duping the backfill path (dedup keys on messageId).
+  api.on(
+    'message_sent',
+    async (event: PluginHookMessageSentEvent): Promise<void> => {
+      if (!event || event.success === false) return;
+      const toRaw = typeof event.to === 'string' ? event.to : '';
+      if (!toRaw) return;
+      // Skip non-Feishu channels and P2P targets — we only track group chats.
+      // `to` shape examples:
+      //   feishu:group:oc_xxx  → group chat we care about
+      //   feishu:oc_xxx        → group chat (some host versions)
+      //   feishu:ou_xxx        → P2P, skip
+      //   telegram:...         → other channel, skip
+      const stripped = stripChannelPrefix(toRaw);
+      if (!stripped.startsWith('oc_')) return;
+      const chatId = stripped;
+      const content = typeof event.content === 'string' ? event.content : '';
+      const ownAppId = getOwnAppId();
+      // Use the bot's own app_id as senderOpenId. Matches the convention
+      // the API backfill uses for bot senders (sender.id_type='app_id'),
+      // and avoids colliding with Module C's `botOpenId === senderOpenId`
+      // filter (which compares against the bot's ou_ open_id and would
+      // exclude our own messages from the context block — exactly what
+      // we DON'T want for multi-turn coherence).
+      const senderOpenId = ownAppId || '';
+      store.append({
+        ts: Date.now(),
+        chatId,
+        senderOpenId,
+        senderName: '',
+        msgType: 'text',
+        messageId: event.messageId || '',
+        content,
+      });
+      log(
+        api,
+        'debug',
+        `transcript outbound captured chat=${chatId} msg=${(event.messageId || '?').slice(-10)} bytes=${content.length}`,
+      );
     },
   );
 }

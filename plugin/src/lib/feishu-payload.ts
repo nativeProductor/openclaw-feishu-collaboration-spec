@@ -102,7 +102,7 @@ function findFeishuEnvelope(input: unknown): Record<string, unknown> | undefined
  *   "feishu:chat:oc_38e..." → "oc_38e..."
  *   "oc_38e..."             → "oc_38e..."
  */
-function stripChannelPrefix(value: string): string {
+export function stripChannelPrefix(value: string): string {
   let out = value;
   // strip up to two layers of "<prefix>:" if they don't match the Feishu id shape
   for (let i = 0; i < 2; i++) {

@@ -617,16 +617,24 @@ export function register(api: PluginApi): void {
     }
 
     const existing = readOutboundText(event);
-    // Skip @-back if the model produced no substantive content this turn.
-    // Otherwise we'd ship a message that's just "<at user_id=…></at>" with
-    // no body — worse than letting the empty reply through (Feishu drops
-    // empty messages, and even if it didn't, the peer's model gets a
-    // useless trigger). Observed in bot-vs-bot tests when the model
-    // occasionally returns a single-token reply.
-    if (existing.trim().length === 0) {
+    // Skip @-back if the model has nothing substantive to say this turn —
+    // either pure whitespace OR a payload consisting only of @-tags (no
+    // body text after stripping the tags). Otherwise we ship a message
+    // whose entire content is just an @-mention with no actual reply
+    // text. Worse: the Feishu plugin's send pipeline auto-prepends @-tags
+    // via the `mentions` array when replying to a mention, so even an
+    // empty `lastAssistant` can result in a bare-@ outbound. We mutate
+    // `lastAssistant` to empty here so the channel layer has nothing to
+    // wrap. (Empty messages are typically dropped by Feishu.)
+    const stripped = existing
+      .replace(/<at user_id="[^"]+"\s*>[\s\S]*?<\/at>/g, '')
+      .replace(/<at user_id="[^"]+"\s*\/>/g, '')
+      .trim();
+    if (stripped.length === 0) {
+      writeOutboundText(event, '');
       // eslint-disable-next-line no-console
       console.log(
-        `${LOG_PREFIX} cross-bot at-back-skipped reason=empty-llm-output target=${summary.senderOpenId}`,
+        `${LOG_PREFIX} cross-bot at-back-skipped reason=${existing.trim().length === 0 ? 'empty-llm-output' : 'at-tag-only'} target=${summary.senderOpenId}`,
       );
       return undefined;
     }
